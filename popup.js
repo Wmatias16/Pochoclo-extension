@@ -12,11 +12,12 @@ const timerLabel = document.getElementById('timerLabel');
 const statusBadge = document.getElementById('statusBadge');
 const ringOuter = document.getElementById('ringOuter');
 const ringGlow = document.getElementById('ringGlow');
-const waveform = document.getElementById('waveform');
+const centerDot = document.getElementById('centerDot');
+const visualizerCanvas = document.getElementById('visualizerCanvas');
+const ctx = visualizerCanvas.getContext('2d');
 const transcriptBox = document.getElementById('transcriptBox');
 const transcriptText = document.getElementById('transcriptText');
 const placeholder = document.getElementById('placeholder');
-const waveBars = waveform.querySelectorAll('.wave-bar');
 
 let timerInterval = null;
 let waveformInterval = null;
@@ -37,13 +38,17 @@ function sendBg(action, extra = {}) {
 }
 
 // ── UI update from state ──
+let waveformAnimFrame = null;
+
 function applyUI(state) {
   // Clear previous intervals
   clearInterval(timerInterval);
-  clearInterval(waveformInterval);
+  clearTimeout(waveformInterval);
+  cancelAnimationFrame(waveformAnimFrame);
   clearInterval(transcriptInterval);
   timerInterval = null;
   waveformInterval = null;
+  waveformAnimFrame = null;
   transcriptInterval = null;
 
   if (state.status === 'recording') {
@@ -56,18 +61,90 @@ function applyUI(state) {
       timerEl.textContent = formatTime(now);
     }, 500);
 
-    // Live waveform from offscreen analyser
-    waveBars.forEach(bar => bar.classList.add('active'));
-    waveformInterval = setInterval(async () => {
+    // Live visualizer — dense soundwave bars inside ring
+    const NUM_BARS = 48;
+    const smoothed = new Float32Array(NUM_BARS).fill(0);
+    let time = 0;
+
+    async function drawVisualizer() {
       const resp = await sendBg('getWaveform');
-      if (resp && resp.data) {
-        waveBars.forEach((bar, i) => {
-          const index = Math.floor(i * resp.data.length / waveBars.length);
-          const value = resp.data[index] || 0;
-          bar.style.height = Math.max(8, (value / 255) * 56) + 'px';
-        });
+      const data = resp && resp.data ? resp.data : [];
+
+      const W = visualizerCanvas.width;
+      const H = visualizerCanvas.height;
+      const cx = W / 2;
+      const cy = H / 2;
+      const ringR = 82;
+
+      ctx.clearRect(0, 0, W, H);
+
+      // Clip to circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Smooth audio data into half-array, then mirror for symmetry
+      const HALF = NUM_BARS / 2;
+      let avg = 0;
+      for (let i = 0; i < HALF; i++) {
+        const dataIdx = Math.floor(i * data.length / HALF);
+        const raw = (data[dataIdx] || 0) / 255;
+        smoothed[i] += (raw - smoothed[i]) * 0.35;
+        avg += smoothed[i];
       }
-    }, 150);
+      avg /= HALF;
+      time += 0.07;
+
+      // Build mirrored array: center = loudest, edges = quietest
+      const mirrored = new Float32Array(NUM_BARS);
+      for (let i = 0; i < HALF; i++) {
+        mirrored[HALF - 1 - i] = smoothed[i]; // left half (center→left)
+        mirrored[HALF + i]     = smoothed[i]; // right half (center→right)
+      }
+
+      // Bars span full ring diameter, centered
+      const barsWidth = ringR * 2;
+      const barSpacing = barsWidth / NUM_BARS;
+      const barW = 2.5;
+      const startX = cx - ringR;
+      const maxH = ringR * 1.5;
+
+      // Create gradient (dark gray top -> red/pink bottom)
+      const grad = ctx.createLinearGradient(0, cy - ringR, 0, cy + ringR);
+      grad.addColorStop(0, '#5a5a5a');
+      grad.addColorStop(0.45, '#9b6a6a');
+      grad.addColorStop(1, '#dc2626');
+
+      for (let i = 0; i < NUM_BARS; i++) {
+        const val = mirrored[i];
+
+        // Faster wobble for more energy
+        const wobble = Math.sin(time * 3 + i * 0.4) * 0.06
+                      + Math.sin(time * 2 + i * 0.7) * 0.04;
+
+        const h = Math.max(4, (val + wobble * (0.3 + val)) * maxH);
+        const x = startX + i * barSpacing + (barSpacing - barW) / 2;
+        const y = cy - h / 2;
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.roundRect(x, y, barW, h, 1.2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+
+      // Subtle ring breathing
+      const scale = 1 + avg * 0.03;
+      ringOuter.style.transform = `scale(${scale})`;
+
+      waveformInterval = setTimeout(() => {
+        waveformAnimFrame = requestAnimationFrame(drawVisualizer);
+      }, 40);
+    }
+
+    waveformAnimFrame = requestAnimationFrame(drawVisualizer);
 
     // Live transcript polling from storage
     transcriptInterval = setInterval(async () => {
@@ -94,7 +171,6 @@ function applyUI(state) {
     timerEl.textContent = formatTime(elapsed);
 
     resetWaveBars();
-    waveBars.forEach(bar => bar.classList.add('active'));
 
     btnRecord.classList.add('recording');
     btnPause.disabled = false;
@@ -137,10 +213,8 @@ function applyUI(state) {
 }
 
 function resetWaveBars() {
-  waveBars.forEach(bar => {
-    bar.style.height = '8px';
-    bar.classList.remove('active');
-  });
+  ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+  ringOuter.style.transform = '';
 }
 
 // ── Transcript UI helpers ──

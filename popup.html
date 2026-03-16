@@ -86,13 +86,13 @@
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 32px 20px 24px;
+      padding: 28px 20px 20px;
     }
 
     .visualizer-ring {
       position: relative;
-      width: 160px;
-      height: 160px;
+      width: 180px;
+      height: 180px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -102,47 +102,34 @@
       position: absolute;
       inset: 0;
       border-radius: 50%;
-      border: 2px solid rgba(220, 38, 38, 0.1);
-      transition: all 0.5s ease;
+      border: 2.5px solid rgba(220, 38, 38, 0.08);
+      transition: all 0.4s cubic-bezier(.4,0,.2,1);
     }
 
     .ring-outer.active {
-      border-color: rgba(220, 38, 38, 0.35);
-      animation: ring-pulse 2s ease-in-out infinite;
+      border-color: rgba(220, 38, 38, 0.25);
     }
 
     .ring-glow {
       position: absolute;
-      inset: 8px;
+      inset: 6px;
       border-radius: 50%;
-      background: radial-gradient(circle, rgba(220, 38, 38, 0.04) 0%, transparent 70%);
-      transition: all 0.5s ease;
+      background: radial-gradient(circle, rgba(220, 38, 38, 0.02) 0%, transparent 70%);
+      transition: all 0.3s ease;
     }
 
     .ring-glow.active {
-      background: radial-gradient(circle, rgba(220, 38, 38, 0.12) 0%, transparent 70%);
-      animation: glow-pulse 2s ease-in-out infinite;
+      background: radial-gradient(circle, rgba(220, 38, 38, 0.08) 0%, transparent 70%);
     }
 
-    /* Waveform bars */
-    .waveform {
-      display: flex;
-      align-items: center;
-      gap: 3px;
-      height: 60px;
+    .visualizer-canvas {
+      position: absolute;
+      inset: 0;
       z-index: 1;
     }
 
-    .wave-bar {
-      width: 4px;
-      height: 8px;
-      background: rgba(220, 38, 38, 0.15);
-      border-radius: 4px;
-      transition: height 0.15s ease, background 0.3s ease;
-    }
-
-    .wave-bar.active {
-      background: linear-gradient(180deg, #ef4444, #dc2626);
+    .ring-center-dot {
+      display: none;
     }
 
     /* Timer */
@@ -454,16 +441,6 @@
       50% { opacity: 0.6; }
     }
 
-    @keyframes ring-pulse {
-      0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(1.04); opacity: 0.7; }
-    }
-
-    @keyframes glow-pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-
     @keyframes blink {
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
@@ -507,29 +484,11 @@
 
   <!-- Visualizer -->
   <div class="visualizer-section">
-    <div class="visualizer-ring">
+    <div class="visualizer-ring" id="visualizerRing">
       <div class="ring-outer" id="ringOuter"></div>
       <div class="ring-glow" id="ringGlow"></div>
-      <div class="waveform" id="waveform">
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-      </div>
+      <canvas class="visualizer-canvas" id="visualizerCanvas" width="180" height="180"></canvas>
+      <div class="ring-center-dot" id="centerDot"></div>
     </div>
 
     <div class="timer" id="timer">00:00</div>

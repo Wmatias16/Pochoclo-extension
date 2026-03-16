@@ -4,6 +4,20 @@
 // ── State stored in chrome.storage.local ──
 // { status: 'idle'|'recording'|'paused', startTime, pausedAt, pausedDuration }
 
+// ── Serialized transcript writes (prevents race conditions) ──
+let saveChain = Promise.resolve();
+function saveTranscriptQueued(text) {
+  saveChain = saveChain.then(() => new Promise((resolve) => {
+    chrome.storage.local.get('transcript', ({ transcript }) => {
+      const current = transcript || { final: '', interim: '' };
+      current.final = (current.final || '') + text;
+      current.interim = '';
+      chrome.storage.local.set({ transcript: current }, resolve);
+    });
+  }));
+  return saveChain;
+}
+
 async function getState() {
   const { recState } = await chrome.storage.local.get('recState');
   return recState || { status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0 };
@@ -93,12 +107,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'saveTranscript':
-      chrome.storage.local.get('transcript', ({ transcript }) => {
-        const current = transcript || { final: '', interim: '' };
-        current.final = (current.final || '') + msg.text;
-        current.interim = '';
-        chrome.storage.local.set({ transcript: current }, () => sendResponse({ ok: true }));
-      });
+      saveTranscriptQueued(msg.text).then(() => sendResponse({ ok: true }));
       return true;
   }
 });
@@ -145,9 +154,10 @@ async function handleStop() {
   await setState({ status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0 });
   // Keep transcript in storage (don't clear it, user might want to copy)
   try {
+    // stop is now async — waits for final chunk + queue to drain
     await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
-    // Keep offscreen alive for last transcription chunk + download
-    setTimeout(() => closeOffscreen(), 15000);
+    // Give extra time for the last Whisper API call to complete
+    setTimeout(() => closeOffscreen(), 5000);
   } catch (e) {
     // Offscreen may already be gone — that's fine
     await closeOffscreen().catch(() => {});

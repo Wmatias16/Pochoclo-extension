@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pochocla - Transcriptor</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 380px;
+      min-height: 520px;
+      font-family: 'Inter', sans-serif;
+      background: #ffffff;
+      color: #1a1a2e;
+      overflow-x: hidden;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 20px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .brand-name {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      color: #1a1a2e;
+    }
+
+    .status-badge {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 20px;
+      background: #f1f1f5;
+      color: #8b8b9e;
+      transition: all 0.3s ease;
+    }
+
+    .status-badge.recording {
+      background: rgba(220, 38, 38, 0.1);
+      color: #dc2626;
+      animation: pulse-badge 2s ease-in-out infinite;
+    }
+
+    .status-badge.paused {
+      background: rgba(234, 179, 8, 0.1);
+      color: #ca8a04;
+    }
+
+    /* Visualizer Section */
+    .visualizer-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 20px 24px;
+    }
+
+    .visualizer-ring {
+      position: relative;
+      width: 160px;
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ring-outer {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 2px solid rgba(220, 38, 38, 0.1);
+      transition: all 0.5s ease;
+    }
+
+    .ring-outer.active {
+      border-color: rgba(220, 38, 38, 0.35);
+      animation: ring-pulse 2s ease-in-out infinite;
+    }
+
+    .ring-glow {
+      position: absolute;
+      inset: 8px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(220, 38, 38, 0.04) 0%, transparent 70%);
+      transition: all 0.5s ease;
+    }
+
+    .ring-glow.active {
+      background: radial-gradient(circle, rgba(220, 38, 38, 0.12) 0%, transparent 70%);
+      animation: glow-pulse 2s ease-in-out infinite;
+    }
+
+    /* Waveform bars */
+    .waveform {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      height: 60px;
+      z-index: 1;
+    }
+
+    .wave-bar {
+      width: 4px;
+      height: 8px;
+      background: rgba(220, 38, 38, 0.15);
+      border-radius: 4px;
+      transition: height 0.15s ease, background 0.3s ease;
+    }
+
+    .wave-bar.active {
+      background: linear-gradient(180deg, #ef4444, #dc2626);
+    }
+
+    /* Timer */
+    .timer {
+      margin-top: 20px;
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      font-variant-numeric: tabular-nums;
+      color: #1a1a2e;
+    }
+
+    .timer-label {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+    }
+
+    /* Controls */
+    .controls {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 8px 20px 24px;
+    }
+
+    .btn-secondary {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      border: none;
+      background: #f3f4f6;
+      color: #6b7280;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      outline: none;
+    }
+
+    .btn-secondary:hover {
+      background: #e5e7eb;
+      color: #374151;
+      transform: scale(1.05);
+    }
+
+    .btn-secondary:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-record {
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      border: none;
+      background: linear-gradient(135deg, #ef4444, #dc2626);
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s ease;
+      outline: none;
+      box-shadow: 0 4px 24px rgba(220, 38, 38, 0.3);
+      position: relative;
+    }
+
+    .btn-record:hover {
+      transform: scale(1.06);
+      box-shadow: 0 6px 32px rgba(220, 38, 38, 0.4);
+    }
+
+    .btn-record:active {
+      transform: scale(0.96);
+    }
+
+    .btn-record.recording {
+      background: linear-gradient(135deg, #b91c1c, #991b1b);
+      box-shadow: 0 4px 24px rgba(185, 28, 28, 0.4);
+    }
+
+    .btn-record .icon-mic {
+      transition: all 0.3s ease;
+    }
+
+    .btn-record .icon-stop {
+      display: none;
+      width: 22px;
+      height: 22px;
+      background: #fff;
+      border-radius: 5px;
+    }
+
+    .btn-record.recording .icon-mic {
+      display: none;
+    }
+
+    .btn-record.recording .icon-stop {
+      display: block;
+    }
+
+    /* Transcript area */
+    .transcript-section {
+      padding: 0 20px 20px;
+    }
+
+    .transcript-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .transcript-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .transcript-copy {
+      background: none;
+      border: none;
+      color: #dc2626;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition: all 0.2s ease;
+      font-family: 'Inter', sans-serif;
+    }
+
+    .transcript-copy:hover {
+      background: rgba(220, 38, 38, 0.06);
+    }
+
+    .transcript-copy:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .transcript-box {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 16px;
+      min-height: 100px;
+      max-height: 160px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #4b5563;
+      transition: border-color 0.3s ease;
+    }
+
+    .transcript-box.active {
+      border-color: rgba(220, 38, 38, 0.25);
+    }
+
+    .transcript-placeholder {
+      color: #c4c8d0;
+      font-style: italic;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 68px;
+      text-align: center;
+      font-size: 12.5px;
+    }
+
+    .cursor-blink {
+      display: inline-block;
+      width: 2px;
+      height: 14px;
+      background: #dc2626;
+      margin-left: 3px;
+      vertical-align: middle;
+      animation: blink 1s step-end infinite;
+    }
+
+    /* Settings */
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn-settings {
+      background: none;
+      border: none;
+      color: #9ca3af;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      transition: all 0.2s ease;
+    }
+
+    .btn-settings:hover {
+      color: #6b7280;
+      background: #f3f4f6;
+    }
+
+    .settings-panel {
+      display: none;
+      padding: 14px 20px;
+      border-bottom: 1px solid rgba(0,0,0,0.06);
+      background: #f9fafb;
+    }
+
+    .settings-panel.open {
+      display: block;
+    }
+
+    .settings-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #6b7280;
+      margin-bottom: 8px;
+      display: block;
+    }
+
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-input {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    .settings-input:focus {
+      border-color: #dc2626;
+    }
+
+    .settings-btn {
+      padding: 8px 16px;
+      background: #dc2626;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: background 0.2s ease;
+    }
+
+    .settings-btn:hover {
+      background: #b91c1c;
+    }
+
+    .settings-hint {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 8px;
+    }
+
+    .settings-hint a {
+      color: #dc2626;
+      text-decoration: none;
+    }
+
+    .settings-saved {
+      color: #16a34a;
+      font-size: 11px;
+      font-weight: 500;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .settings-saved.show {
+      opacity: 1;
+    }
+
+    /* Scrollbar */
+    .transcript-box::-webkit-scrollbar {
+      width: 4px;
+    }
+    .transcript-box::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .transcript-box::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.1);
+      border-radius: 4px;
+    }
+
+    /* Animations */
+    @keyframes pulse-badge {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    @keyframes ring-pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.04); opacity: 0.7; }
+    }
+
+    @keyframes glow-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+
+    /* SVG icons */
+    svg {
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo"><img src="icons/logo.png" alt="Pochocla"></div>
+      <span class="brand-name">Pochocla</span>
+    </div>
+    <div class="header-right">
+      <span class="status-badge" id="statusBadge">Listo</span>
+      <button class="btn-settings" id="btnSettings" title="Configuración">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Settings Panel -->
+  <div class="settings-panel" id="settingsPanel">
+    <label class="settings-label">API Key de OpenAI (Whisper)</label>
+    <div class="settings-row">
+      <input type="password" class="settings-input" id="apiKeyInput" placeholder="sk-..." />
+      <button class="settings-btn" id="btnSaveKey">Guardar</button>
+      <span class="settings-saved" id="keySaved">✓</span>
+    </div>
+    <div class="settings-hint">Transcribe el audio de la pestaña. <a href="https://platform.openai.com/api-keys" target="_blank">Obtener key</a></div>
+  </div>
+
+  <!-- Visualizer -->
+  <div class="visualizer-section">
+    <div class="visualizer-ring">
+      <div class="ring-outer" id="ringOuter"></div>
+      <div class="ring-glow" id="ringGlow"></div>
+      <div class="waveform" id="waveform">
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+      </div>
+    </div>
+
+    <div class="timer" id="timer">00:00</div>
+    <div class="timer-label" id="timerLabel">Presioná grabar para iniciar</div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn-secondary" id="btnPause" disabled title="Pausar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <rect x="6" y="4" width="4" height="16" rx="1"/>
+        <rect x="14" y="4" width="4" height="16" rx="1"/>
+      </svg>
+    </button>
+
+    <button class="btn-record" id="btnRecord" title="Grabar">
+      <svg class="icon-mic" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="2" width="6" height="12" rx="3"/>
+        <path d="M5 10a7 7 0 0 0 14 0"/>
+        <line x1="12" y1="19" x2="12" y2="22"/>
+      </svg>
+      <div class="icon-stop"></div>
+    </button>
+
+    <button class="btn-secondary" id="btnReset" disabled title="Reiniciar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="1 4 1 10 7 10"/>
+        <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Transcript -->
+  <div class="transcript-section">
+    <div class="transcript-header">
+      <span class="transcript-title">Transcripción</span>
+      <button class="transcript-copy" id="btnCopy" disabled>Copiar</button>
+    </div>
+    <div class="transcript-box" id="transcriptBox">
+      <div class="transcript-placeholder" id="placeholder">
+        La transcripción aparecerá aquí...
+      </div>
+      <span id="transcriptText"></span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

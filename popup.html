@@ -423,6 +423,34 @@
       opacity: 1;
     }
 
+    .settings-group {
+      margin-top: 14px;
+    }
+
+    .settings-select {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      background: #fff;
+      color: #1a1a2e;
+      cursor: pointer;
+      transition: border-color 0.2s ease;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      padding-right: 30px;
+    }
+
+    .settings-select:focus {
+      border-color: #dc2626;
+    }
+
     /* Scrollbar */
     .transcript-box::-webkit-scrollbar {
       width: 4px;
@@ -480,6 +508,27 @@
       <span class="settings-saved" id="keySaved">✓</span>
     </div>
     <div class="settings-hint">Transcribe el audio de la pestaña. <a href="https://platform.openai.com/api-keys" target="_blank">Obtener key</a></div>
+
+    <div class="settings-group">
+      <label class="settings-label">Idioma del audio</label>
+      <div class="settings-row">
+        <select class="settings-select" id="langSelect">
+          <option value="es">Español</option>
+          <option value="en">English</option>
+          <option value="pt">Português</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="it">Italiano</option>
+          <option value="ja">日本語</option>
+          <option value="zh">中文</option>
+          <option value="ko">한국어</option>
+          <option value="ru">Русский</option>
+          <option value="ar">العربية</option>
+          <option value="hi">हिन्दी</option>
+        </select>
+      </div>
+      <div class="settings-hint">Idioma del audio original. La transcripción siempre será en español.</div>
+    </div>
   </div>
 
   <!-- Visualizer -->

@@ -369,6 +369,7 @@ const settingsPanel = document.getElementById('settingsPanel');
 const apiKeyInput = document.getElementById('apiKeyInput');
 const btnSaveKey = document.getElementById('btnSaveKey');
 const keySaved = document.getElementById('keySaved');
+const langSelect = document.getElementById('langSelect');
 
 btnSettings.addEventListener('click', () => {
   settingsPanel.classList.toggle('open');
@@ -378,6 +379,16 @@ chrome.storage.local.get('openaiApiKey', ({ openaiApiKey }) => {
   if (openaiApiKey) {
     apiKeyInput.value = openaiApiKey;
   }
+});
+
+chrome.storage.local.get('audioLanguage', ({ audioLanguage }) => {
+  if (audioLanguage) {
+    langSelect.value = audioLanguage;
+  }
+});
+
+langSelect.addEventListener('change', () => {
+  chrome.storage.local.set({ audioLanguage: langSelect.value });
 });
 
 btnSaveKey.addEventListener('click', () => {

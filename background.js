@@ -101,8 +101,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
 
     case 'getApiKey':
-      chrome.storage.local.get('openaiApiKey', (data) => {
-        sendResponse({ key: data.openaiApiKey || null });
+      chrome.storage.local.get(['openaiApiKey', 'audioLanguage'], (data) => {
+        sendResponse({ key: data.openaiApiKey || null, language: data.audioLanguage || 'es' });
       });
       return true;
 

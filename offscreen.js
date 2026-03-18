@@ -232,17 +232,19 @@ function isHallucination(text) {
 }
 
 async function transcribeChunk(blob) {
-  // Offscreen can't use chrome.storage — ask background for the key
-  const { key } = await chrome.runtime.sendMessage({ target: 'background', action: 'getApiKey' });
+  // Offscreen can't use chrome.storage — ask background for the key + language
+  const { key, language } = await chrome.runtime.sendMessage({ target: 'background', action: 'getApiKey' });
   if (!key) {
     console.warn('Whisper: no API key configured');
     return;
   }
 
+  const lang = language || 'es';
+
   const formData = new FormData();
   formData.append('file', blob, 'audio.webm');
   formData.append('model', 'whisper-1');
-  formData.append('language', 'es');
+  formData.append('language', lang);
 
   try {
     const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
@@ -256,15 +258,59 @@ async function transcribeChunk(blob) {
       return;
     }
     if (data.text && data.text.trim() && !isHallucination(data.text)) {
+      let finalText = data.text.trim();
+
+      // If source language is not Spanish, translate to Spanish via GPT
+      if (lang !== 'es') {
+        finalText = await translateToSpanish(key, finalText, lang);
+        if (!finalText) return;
+      }
+
       // Save transcript through background (offscreen can't access chrome.storage)
       await chrome.runtime.sendMessage({
         target: 'background',
         action: 'saveTranscript',
-        text: data.text.trim() + ' '
+        text: finalText + ' '
       });
     }
   } catch (e) {
     console.warn('Whisper transcription error:', e);
+  }
+}
+
+async function translateToSpanish(apiKey, text, sourceLang) {
+  try {
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'Sos un traductor. Traducí el texto al español. Devolvé SOLO la traducción, sin explicaciones ni texto adicional. Mantené el tono y estilo original.'
+          },
+          {
+            role: 'user',
+            content: text
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 1024
+      })
+    });
+    const data = await resp.json();
+    if (data.error) {
+      console.warn('Translation API error:', data.error.message);
+      return text; // Fallback: return original text
+    }
+    return data.choices?.[0]?.message?.content?.trim() || text;
+  } catch (e) {
+    console.warn('Translation error:', e);
+    return text; // Fallback: return original text
   }
 }
 

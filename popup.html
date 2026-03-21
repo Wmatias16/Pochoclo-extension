@@ -478,6 +478,234 @@
     svg {
       flex-shrink: 0;
     }
+
+    /* Views */
+    #viewRecorder, #viewHistory, #viewDetail { display: none; }
+    #viewRecorder.active, #viewHistory.active, #viewDetail.active { display: block; }
+
+    .btn-back {
+      background: none;
+      border: none;
+      color: #6b7280;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 6px;
+      display: none;
+      align-items: center;
+      transition: all 0.2s ease;
+    }
+    .btn-back:hover { color: #1a1a2e; background: #f3f4f6; }
+    .btn-back.visible { display: flex; }
+
+    .btn-history {
+      background: none;
+      border: none;
+      color: #9ca3af;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      transition: all 0.2s ease;
+    }
+    .btn-history:hover { color: #6b7280; background: #f3f4f6; }
+
+    /* History view */
+    .history-container { padding: 16px 20px; }
+    .history-section-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .history-count {
+      font-size: 11px;
+      font-weight: 500;
+      background: #f1f1f5;
+      color: #8b8b9e;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 420px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .history-item {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .history-item:hover { border-color: #d1d5db; background: #f3f4f6; }
+    .history-item-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #1a1a2e;
+      margin-bottom: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .history-item-meta {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .history-item-meta .dot, .detail-meta .dot {
+      width: 3px;
+      height: 3px;
+      background: #d1d5db;
+      border-radius: 50%;
+    }
+    .history-item-preview {
+      font-size: 12px;
+      color: #6b7280;
+      line-height: 1.5;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .history-empty {
+      text-align: center;
+      padding: 48px 20px;
+      color: #c4c8d0;
+      font-size: 13px;
+    }
+    .history-empty-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.5; }
+    .history-empty-text { font-style: italic; }
+    .history-list::-webkit-scrollbar { width: 4px; }
+    .history-list::-webkit-scrollbar-track { background: transparent; }
+    .history-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
+
+    /* Detail view */
+    .detail-container { padding: 20px; }
+    .detail-title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .detail-title {
+      flex: 1;
+      font-size: 15px;
+      font-weight: 600;
+      color: #1a1a2e;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-family: 'Inter', sans-serif;
+      outline: none;
+      transition: border-color 0.2s ease;
+      background: transparent;
+    }
+    .detail-title:hover { border-color: #e5e7eb; }
+    .detail-title:focus { border-color: #dc2626; background: #fff; }
+    .detail-save-title {
+      background: none;
+      border: none;
+      color: #16a34a;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-family: 'Inter', sans-serif;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+    }
+    .detail-save-title.visible { opacity: 1; }
+    .detail-meta {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-bottom: 4px;
+      padding: 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .detail-url {
+      font-size: 11px;
+      color: #b0b5bf;
+      padding: 0 10px;
+      margin-bottom: 16px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .detail-text-box {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 16px;
+      min-height: 200px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #4b5563;
+      margin-bottom: 16px;
+      white-space: pre-wrap;
+    }
+    .detail-text-box::-webkit-scrollbar { width: 4px; }
+    .detail-text-box::-webkit-scrollbar-track { background: transparent; }
+    .detail-text-box::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
+    .detail-actions { display: flex; gap: 8px; }
+    .btn-detail {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .btn-detail-copy { background: #f3f4f6; color: #374151; }
+    .btn-detail-copy:hover { background: #e5e7eb; }
+    .btn-detail-delete { background: rgba(220, 38, 38, 0.06); color: #dc2626; }
+    .btn-detail-delete:hover { background: rgba(220, 38, 38, 0.12); }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%) translateY(60px);
+      background: #1a1a2e;
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      z-index: 100;
+      opacity: 0;
+      transition: all 0.3s ease;
+      pointer-events: none;
+    }
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
   </style>
 </head>
 <body>
@@ -485,11 +713,22 @@
   <!-- Header -->
   <div class="header">
     <div class="header-left">
+      <button class="btn-back" id="btnBack" title="Volver">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+      </button>
       <div class="logo"><img src="icons/logo.png" alt="Pochocla"></div>
       <span class="brand-name">Pochocla</span>
     </div>
     <div class="header-right">
       <span class="status-badge" id="statusBadge">Listo</span>
+      <button class="btn-history" id="btnHistory" title="Historial">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 8v4l3 3"/>
+          <circle cx="12" cy="12" r="10"/>
+        </svg>
+      </button>
       <button class="btn-settings" id="btnSettings" title="Configuración">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
@@ -530,6 +769,9 @@
       <div class="settings-hint">Idioma del audio original. La transcripción siempre será en español.</div>
     </div>
   </div>
+
+  <!-- View: Recorder -->
+  <div id="viewRecorder" class="active">
 
   <!-- Visualizer -->
   <div class="visualizer-section">
@@ -583,6 +825,49 @@
       <span id="transcriptText"></span>
     </div>
   </div>
+
+  </div><!-- /viewRecorder -->
+
+  <!-- View: History -->
+  <div id="viewHistory">
+    <div class="history-container">
+      <div class="history-section-title">
+        Historial
+        <span class="history-count" id="historyCount">0</span>
+      </div>
+      <div class="history-list" id="historyList"></div>
+      <div class="history-empty" id="historyEmpty">
+        <div class="history-empty-icon">📝</div>
+        <div class="history-empty-text">No hay transcripciones guardadas.<br>Las grabaciones se guardan automáticamente.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- View: Detail -->
+  <div id="viewDetail">
+    <div class="detail-container">
+      <div class="detail-title-row">
+        <input class="detail-title" id="detailTitle" type="text" />
+        <button class="detail-save-title" id="btnSaveTitle">Guardar</button>
+      </div>
+      <div class="detail-meta" id="detailMeta"></div>
+      <div class="detail-url" id="detailUrl"></div>
+      <div class="detail-text-box" id="detailText"></div>
+      <div class="detail-actions">
+        <button class="btn-detail btn-detail-copy" id="btnDetailCopy">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copiar
+        </button>
+        <button class="btn-detail btn-detail-delete" id="btnDetailDelete">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          Eliminar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
 
   <script src="popup.js"></script>
 </body>

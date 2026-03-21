@@ -19,6 +19,29 @@ const transcriptBox = document.getElementById('transcriptBox');
 const transcriptText = document.getElementById('transcriptText');
 const placeholder = document.getElementById('placeholder');
 
+// Views & navigation
+const viewRecorder = document.getElementById('viewRecorder');
+const viewHistory = document.getElementById('viewHistory');
+const viewDetail = document.getElementById('viewDetail');
+const btnBack = document.getElementById('btnBack');
+const btnHistory = document.getElementById('btnHistory');
+const toastEl = document.getElementById('toast');
+
+// Detail view
+const detailTitle = document.getElementById('detailTitle');
+const detailMeta = document.getElementById('detailMeta');
+const detailUrl = document.getElementById('detailUrl');
+const detailText = document.getElementById('detailText');
+const btnSaveTitle = document.getElementById('btnSaveTitle');
+const btnDetailCopy = document.getElementById('btnDetailCopy');
+const btnDetailDelete = document.getElementById('btnDetailDelete');
+const historyList = document.getElementById('historyList');
+const historyEmpty = document.getElementById('historyEmpty');
+const historyCount = document.getElementById('historyCount');
+
+let currentView = 'recorder';
+let currentDetailId = null;
+
 let timerInterval = null;
 let waveformInterval = null;
 let transcriptInterval = null;
@@ -35,6 +58,41 @@ function sendBg(action, extra = {}) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ target: 'background', action, ...extra }, resolve);
   });
+}
+
+// ── View switching ──
+function showView(view) {
+  currentView = view;
+  viewRecorder.classList.toggle('active', view === 'recorder');
+  viewHistory.classList.toggle('active', view === 'history');
+  viewDetail.classList.toggle('active', view === 'detail');
+  btnBack.classList.toggle('visible', view !== 'recorder');
+  if (view !== 'recorder') settingsPanel.classList.remove('open');
+}
+
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), 2500);
+}
+
+function formatDate(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString('es-AR', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function formatDuration(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m > 0 ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`;
+}
+
+const LANG_NAMES = { es: 'Español', en: 'English', pt: 'Português', fr: 'Français', de: 'Deutsch', it: 'Italiano', ja: '日本語', zh: '中文', ko: '한국어', ru: 'Русский', ar: 'العربية', hi: 'हिन्दी' };
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
 }
 
 // ── UI update from state ──
@@ -307,7 +365,7 @@ btnRecord.addEventListener('click', async () => {
       return;
     }
 
-    const resp = await sendBg('startCapture', { tabId: tab.id });
+    const resp = await sendBg('startCapture', { tabId: tab.id, tabTitle: tab.title, tabUrl: tab.url });
     if (!resp || !resp.ok) {
       timerLabel.textContent = 'Error: ' + (resp?.error || 'desconocido');
       return;
@@ -329,6 +387,7 @@ btnRecord.addEventListener('click', async () => {
     const { transcript } = await chrome.storage.local.get('transcript');
     if (transcript && transcript.final) {
       updateTranscriptUI(transcript.final, '');
+      showToast('✓ Guardado en historial');
     }
   }
 });
@@ -398,4 +457,119 @@ btnSaveKey.addEventListener('click', () => {
     keySaved.classList.add('show');
     setTimeout(() => keySaved.classList.remove('show'), 2000);
   }
+});
+
+// ── View navigation ──
+btnBack.addEventListener('click', () => {
+  if (currentView === 'detail') {
+    showView('history');
+    loadHistory();
+  } else {
+    showView('recorder');
+  }
+});
+
+btnHistory.addEventListener('click', () => {
+  if (currentView === 'history') {
+    showView('recorder');
+  } else {
+    showView('history');
+    loadHistory();
+  }
+});
+
+// ── History ──
+async function loadHistory() {
+  const list = await sendBg('getTranscriptions');
+  historyCount.textContent = list.length;
+
+  if (list.length === 0) {
+    historyList.style.display = 'none';
+    historyEmpty.style.display = 'block';
+    return;
+  }
+
+  historyEmpty.style.display = 'none';
+  historyList.style.display = 'flex';
+  historyList.innerHTML = '';
+
+  list.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'history-item';
+    const preview = item.text.length > 100 ? item.text.slice(0, 100) + '…' : item.text;
+    const langName = LANG_NAMES[item.language] || item.language;
+
+    el.innerHTML = `
+      <div class="history-item-title">${escapeHtml(item.title)}</div>
+      <div class="history-item-meta">
+        ${formatDate(item.date)}
+        <span class="dot"></span>
+        ${formatDuration(item.duration)}
+        <span class="dot"></span>
+        ${escapeHtml(langName)}
+      </div>
+      <div class="history-item-preview">${escapeHtml(preview)}</div>
+    `;
+
+    el.addEventListener('click', () => openDetail(item));
+    historyList.appendChild(el);
+  });
+}
+
+// ── Detail view ──
+function openDetail(item) {
+  currentDetailId = item.id;
+  detailTitle.value = item.title;
+  detailTitle.dataset.original = item.title;
+  btnSaveTitle.classList.remove('visible');
+
+  const langName = LANG_NAMES[item.language] || item.language;
+  detailMeta.innerHTML = `
+    ${formatDate(item.date)}
+    <span class="dot"></span>
+    ${formatDuration(item.duration)}
+    <span class="dot"></span>
+    ${escapeHtml(langName)}
+  `;
+
+  let hostname = '';
+  try { hostname = new URL(item.url).hostname; } catch {}
+  detailUrl.textContent = hostname;
+  detailUrl.style.display = hostname ? 'block' : 'none';
+  detailText.textContent = item.text;
+
+  showView('detail');
+}
+
+detailTitle.addEventListener('input', () => {
+  const changed = detailTitle.value !== detailTitle.dataset.original;
+  btnSaveTitle.classList.toggle('visible', changed);
+});
+
+btnSaveTitle.addEventListener('click', async () => {
+  if (!currentDetailId) return;
+  const newTitle = detailTitle.value.trim();
+  if (!newTitle) return;
+  await sendBg('updateTranscription', { id: currentDetailId, updates: { title: newTitle } });
+  detailTitle.dataset.original = newTitle;
+  btnSaveTitle.classList.remove('visible');
+  showToast('Título actualizado');
+});
+
+btnDetailCopy.addEventListener('click', () => {
+  const text = detailText.textContent;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    showToast('¡Copiado!');
+  });
+});
+
+btnDetailDelete.addEventListener('click', async () => {
+  if (!currentDetailId) return;
+  if (!confirm('¿Eliminar esta transcripción?')) return;
+  await sendBg('deleteTranscription', { id: currentDetailId });
+  currentDetailId = null;
+  showView('history');
+  loadHistory();
+  showToast('Transcripción eliminada');
 });

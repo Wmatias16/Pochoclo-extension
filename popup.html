@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pochocla - Transcriptor</title>
+  <title>Pochoclo - Transcriptor</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
@@ -149,6 +149,40 @@
       font-weight: 500;
       text-transform: uppercase;
       letter-spacing: 1.5px;
+    }
+
+    .session-meta {
+      display: flex;
+      justify-content: center;
+      padding: 0 20px 16px;
+    }
+
+    .session-meta-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #eef2ff;
+      color: #4338ca;
+      text-align: center;
+    }
+
+    .session-meta-pill.warning {
+      background: rgba(234, 179, 8, 0.12);
+      color: #a16207;
+    }
+
+    .session-meta-pill.danger {
+      background: rgba(220, 38, 38, 0.1);
+      color: #b91c1c;
+    }
+
+    .session-meta-pill.neutral {
+      background: #eef2ff;
+      color: #4338ca;
     }
 
     /* Controls */
@@ -451,6 +485,182 @@
       border-color: #dc2626;
     }
 
+    .settings-panel-scroll {
+      max-height: 360px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .settings-panel-scroll::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .settings-panel-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .settings-panel-scroll::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.1);
+      border-radius: 4px;
+    }
+
+    .provider-inline-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    .provider-live-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      background: #eef2ff;
+      color: #4338ca;
+    }
+
+    .provider-live-chip.recording {
+      background: rgba(220, 38, 38, 0.08);
+      color: #b91c1c;
+    }
+
+    .provider-cards {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .provider-card {
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid #e5e7eb;
+      background: #fff;
+    }
+
+    .provider-card.disabled {
+      opacity: 0.72;
+    }
+
+    .provider-card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .provider-card-title-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .provider-card-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #1a1a2e;
+    }
+
+    .provider-card-description {
+      font-size: 11px;
+      line-height: 1.45;
+      color: #9ca3af;
+    }
+
+    .provider-card-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #4b5563;
+      white-space: nowrap;
+    }
+
+    .provider-card-toggle input {
+      accent-color: #dc2626;
+    }
+
+    .provider-card-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .provider-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      background: #eef2ff;
+      color: #4338ca;
+    }
+
+    .provider-badge.ready {
+      background: rgba(22, 163, 74, 0.1);
+      color: #15803d;
+    }
+
+    .provider-badge.warning {
+      background: rgba(234, 179, 8, 0.12);
+      color: #a16207;
+    }
+
+    .provider-badge.muted {
+      background: #f3f4f6;
+      color: #6b7280;
+    }
+
+    .provider-field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .provider-field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .provider-field.full {
+      grid-column: 1 / -1;
+    }
+
+    .provider-field-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #6b7280;
+    }
+
+    .provider-field .settings-input {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .provider-field-hint {
+      font-size: 10px;
+      line-height: 1.45;
+      color: #9ca3af;
+    }
+
+    @media (max-width: 420px) {
+      .provider-field-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
     /* Scrollbar */
     .transcript-box::-webkit-scrollbar {
       width: 4px;
@@ -580,6 +790,28 @@
       -webkit-box-orient: vertical;
       overflow: hidden;
     }
+    .history-provider-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      letter-spacing: 0;
+      background: rgba(22, 163, 74, 0.08);
+      color: #15803d;
+    }
+    .history-provider-pill.failed {
+      background: rgba(220, 38, 38, 0.08);
+      color: #b91c1c;
+    }
+    .history-provider-pill.warning {
+      background: rgba(234, 179, 8, 0.12);
+      color: #a16207;
+    }
+    .history-provider-pill.neutral {
+      background: #eef2ff;
+      color: #4338ca;
+    }
     .history-empty {
       text-align: center;
       padding: 48px 20px;
@@ -646,6 +878,126 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .detail-audit-card {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 16px;
+    }
+    .detail-audit-disclosure {
+      padding: 0;
+      overflow: hidden;
+    }
+    .detail-audit-summary-row {
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 14px;
+      cursor: pointer;
+    }
+    .detail-audit-summary-row::-webkit-details-marker {
+      display: none;
+    }
+    .detail-audit-summary-copy {
+      margin-top: 4px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #6b7280;
+    }
+    .detail-audit-body {
+      padding: 0 14px 14px;
+    }
+    .detail-audit-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #374151;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+    .detail-audit-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .detail-audit-summary {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 10px;
+      background: #fff;
+      border: 1px solid #eceff3;
+      border-radius: 10px;
+      font-size: 12px;
+      color: #1f2937;
+    }
+    .audit-summary-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+    }
+    .audit-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      background: #eef2ff;
+      color: #4338ca;
+    }
+    .audit-chip.success {
+      background: rgba(22, 163, 74, 0.1);
+      color: #15803d;
+    }
+    .audit-chip.danger {
+      background: rgba(220, 38, 38, 0.1);
+      color: #b91c1c;
+    }
+    .audit-chip.neutral {
+      background: #eef2ff;
+      color: #4338ca;
+    }
+    .detail-audit-note {
+      font-size: 11px;
+      color: #6b7280;
+      line-height: 1.5;
+      margin-bottom: 12px;
+    }
+    .audit-attempt-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .audit-attempt-item {
+      background: #fff;
+      border: 1px solid #eceff3;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .audit-attempt-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .audit-attempt-provider {
+      font-size: 12px;
+      font-weight: 600;
+      color: #1f2937;
+    }
+    .audit-attempt-error {
+      margin-top: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #6b7280;
     }
     .detail-text-box {
       background: #f9fafb;
@@ -718,8 +1070,8 @@
           <polyline points="15 18 9 12 15 6"/>
         </svg>
       </button>
-      <div class="logo"><img src="icons/logo.png" alt="Pochocla"></div>
-      <span class="brand-name">Pochocla</span>
+      <div class="logo"><img src="icons/logo.png" alt="Pochoclo"></div>
+      <span class="brand-name">Pochoclo</span>
     </div>
     <div class="header-right">
       <span class="status-badge" id="statusBadge">Listo</span>
@@ -740,33 +1092,42 @@
 
   <!-- Settings Panel -->
   <div class="settings-panel" id="settingsPanel">
-    <label class="settings-label">API Key de OpenAI (Whisper)</label>
-    <div class="settings-row">
-      <input type="password" class="settings-input" id="apiKeyInput" placeholder="sk-..." />
-      <button class="settings-btn" id="btnSaveKey">Guardar</button>
-      <span class="settings-saved" id="keySaved">✓</span>
-    </div>
-    <div class="settings-hint">Transcribe el audio de la pestaña. <a href="https://platform.openai.com/api-keys" target="_blank">Obtener key</a></div>
-
-    <div class="settings-group">
-      <label class="settings-label">Idioma del audio</label>
-      <div class="settings-row">
-        <select class="settings-select" id="langSelect">
-          <option value="es">Español</option>
-          <option value="en">English</option>
-          <option value="pt">Português</option>
-          <option value="fr">Français</option>
-          <option value="de">Deutsch</option>
-          <option value="it">Italiano</option>
-          <option value="ja">日本語</option>
-          <option value="zh">中文</option>
-          <option value="ko">한국어</option>
-          <option value="ru">Русский</option>
-          <option value="ar">العربية</option>
-          <option value="hi">हिन्दी</option>
-        </select>
+    <div class="settings-panel-scroll">
+      <div class="settings-group">
+        <label class="settings-label">Provider default global</label>
+        <div class="settings-row">
+          <select class="settings-select" id="defaultProviderSelect"></select>
+          <button class="settings-btn" id="btnSaveProviders">Guardar</button>
+          <span class="settings-saved" id="providerSettingsSaved">✓</span>
+        </div>
+        <div class="settings-hint" id="providerSettingsHint">Elegí con qué provider querés arrancar por defecto. Si no está disponible, Pochoclo hace fallback automático.</div>
       </div>
-      <div class="settings-hint">Idioma del audio original. La transcripción siempre será en español.</div>
+
+      <div class="settings-group">
+        <label class="settings-label">Configuración por provider</label>
+        <div class="provider-cards" id="providerCards"></div>
+      </div>
+
+      <div class="settings-group">
+        <label class="settings-label">Idioma del audio</label>
+        <div class="settings-row">
+          <select class="settings-select" id="langSelect">
+            <option value="es">Español</option>
+            <option value="en">English</option>
+            <option value="pt">Português</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="it">Italiano</option>
+            <option value="ja">日本語</option>
+            <option value="zh">中文</option>
+            <option value="ko">한국어</option>
+            <option value="ru">Русский</option>
+            <option value="ar">العربية</option>
+            <option value="hi">हिन्दी</option>
+          </select>
+        </div>
+        <div class="settings-hint">Idioma del audio original. La transcripción siempre será en español.</div>
+      </div>
     </div>
   </div>
 
@@ -784,6 +1145,10 @@
 
     <div class="timer" id="timer">00:00</div>
     <div class="timer-label" id="timerLabel">Presioná grabar para iniciar</div>
+  </div>
+
+  <div class="session-meta" id="sessionMeta" hidden>
+    <span class="session-meta-pill" id="providerLiveChip"></span>
   </div>
 
   <!-- Controls -->
@@ -852,6 +1217,7 @@
       </div>
       <div class="detail-meta" id="detailMeta"></div>
       <div class="detail-url" id="detailUrl"></div>
+      <div id="detailAudit"></div>
       <div class="detail-text-box" id="detailText"></div>
       <div class="detail-actions">
         <button class="btn-detail btn-detail-copy" id="btnDetailCopy">

@@ -6,13 +6,24 @@ let mediaRecorder = null;
 let audioContext = null;
 let analyser = null;
 let audioChunks = [];
+const chunkProcessor = globalThis.PochoclaChunkProcessor;
+const offscreenBridge = globalThis.PochoclaOffscreenBridge;
+const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
+
+let captureSessionContext = {
+  sessionId: null,
+  language: 'es',
+  activeProvider: null,
+  nextChunkIndex: 0,
+  chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+};
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.target !== 'offscreen') return;
 
   switch (msg.action) {
     case 'start':
-      startRecording(msg.streamId).then(() => sendResponse({ ok: true }))
+      startRecording(msg.streamId, msg.sessionContext).then(() => sendResponse({ ok: true }))
         .catch(err => sendResponse({ ok: false, error: err.message }));
       return true;
 
@@ -37,7 +48,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-async function startRecording(streamId) {
+async function startRecording(streamId, sessionContext) {
+  captureSessionContext = {
+    sessionId: sessionContext && sessionContext.sessionId ? sessionContext.sessionId : null,
+    language: sessionContext && sessionContext.language ? sessionContext.language : 'es',
+    activeProvider: sessionContext && sessionContext.activeProvider ? sessionContext.activeProvider : null,
+    nextChunkIndex: 0,
+    chunkIntervalMs: Number.isFinite(Number(sessionContext && sessionContext.chunkIntervalMs))
+      ? Number(sessionContext.chunkIntervalMs)
+      : DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       mandatory: {
@@ -66,7 +87,7 @@ async function startRecording(streamId) {
 
   mediaRecorder.start(1000);
 
-  // Start transcription capture (sends chunks to Whisper API)
+  // Start transcription capture (hands chunks to background orchestration)
   startTranscriptionCapture();
 }
 
@@ -116,32 +137,52 @@ let transcriptionTimer = null;
 let audioActivityMonitor = null;
 let isTranscribing = false;
 let chunkHadAudio = false;       // tracks audio activity DURING each chunk
-const TRANSCRIPTION_CHUNK_MS = 7000;
 
 // ── Serialized transcription queue ──
-// Ensures chunks are transcribed in order, one at a time
-let transcriptionQueue = [];
-let isProcessingQueue = false;
-let queueDrainResolve = null;    // resolved when queue is empty and no more chunks coming
+// Ensures chunks are handed to background in order, one at a time.
+let queueDrainResolve = null;
+let pendingChunkStop = 0;
+const transcriptionProcessor = chunkProcessor.createSerialProcessor(
+  async (item) => {
+    const response = await offscreenBridge.dispatchChunkToBackground({
+      blob: item.blob,
+      sessionContext: {
+        sessionId: item.sessionId,
+        chunkIndex: item.chunkIndex
+      },
+      sendMessage: chrome.runtime.sendMessage
+    });
+
+    if (!response || !response.ok) {
+      console.warn('Chunk processing failed in background:', response && response.error ? response.error : 'unknown error');
+    }
+  },
+  {
+    onIdle: resolveTranscriptionDrainIfReady,
+    onError(error) {
+      console.warn('Chunk queue error:', error);
+      resolveTranscriptionDrainIfReady();
+    }
+  }
+);
 
 function enqueueTranscription(blob) {
-  transcriptionQueue.push(blob);
-  if (!isProcessingQueue) processQueue();
+  transcriptionProcessor.enqueue({
+    blob,
+    sessionId: captureSessionContext.sessionId,
+    chunkIndex: captureSessionContext.nextChunkIndex
+  });
+  captureSessionContext.nextChunkIndex += 1;
 }
 
-async function processQueue() {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
-
-  while (transcriptionQueue.length > 0) {
-    const blob = transcriptionQueue.shift();
-    await transcribeChunk(blob);
-  }
-
-  isProcessingQueue = false;
-
-  // Signal that queue is drained (used during stop)
-  if (queueDrainResolve && !isTranscribing) {
+function resolveTranscriptionDrainIfReady() {
+  if (
+    queueDrainResolve
+    && !isTranscribing
+    && pendingChunkStop === 0
+    && !transcriptionProcessor.isProcessing()
+    && transcriptionProcessor.size() === 0
+  ) {
     queueDrainResolve();
     queueDrainResolve = null;
   }
@@ -179,11 +220,13 @@ function captureNextChunk() {
     // Enqueue for serialized transcription if there was audio during this chunk
     if (blob.size > 100 && hadAudio) {
       enqueueTranscription(blob);
-    } else if (!isTranscribing && queueDrainResolve && transcriptionQueue.length === 0 && !isProcessingQueue) {
-      // Stopping and this silent chunk was the last — drain immediately
-      queueDrainResolve();
-      queueDrainResolve = null;
     }
+
+    if (pendingChunkStop > 0) {
+      pendingChunkStop -= 1;
+    }
+
+    resolveTranscriptionDrainIfReady();
   };
 
   transcriptionRecorder = recorder;
@@ -204,114 +247,7 @@ function captureNextChunk() {
     if (recorder.state !== 'inactive') {
       recorder.stop();
     }
-  }, TRANSCRIPTION_CHUNK_MS);
-}
-
-// Known Whisper hallucination phrases (silence artifacts)
-const HALLUCINATIONS = [
-  'subt\u00edtulos realizados por la comunidad de amara.org',
-  'subtitulos realizados por la comunidad de amara.org',
-  'amara.org',
-  'subt\u00edtulos realizados por',
-  'subtitulado por',
-  'subt\u00edtulos por',
-  'gracias por ver',
-  'thanks for watching',
-  'thank you for watching',
-  'suscr\u00edbete',
-  'subscribe',
-  '\u00a1suscr\u00edbete al canal!',
-  'you',
-  '...',
-  'MosCatalworking',
-];
-
-function isHallucination(text) {
-  const lower = text.toLowerCase().trim();
-  return HALLUCINATIONS.some(h => lower.includes(h)) || lower.length < 3;
-}
-
-async function transcribeChunk(blob) {
-  // Offscreen can't use chrome.storage — ask background for the key + language
-  const { key, language } = await chrome.runtime.sendMessage({ target: 'background', action: 'getApiKey' });
-  if (!key) {
-    console.warn('Whisper: no API key configured');
-    return;
-  }
-
-  const lang = language || 'es';
-
-  const formData = new FormData();
-  formData.append('file', blob, 'audio.webm');
-  formData.append('model', 'whisper-1');
-  formData.append('language', lang);
-
-  try {
-    const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${key}` },
-      body: formData
-    });
-    const data = await resp.json();
-    if (data.error) {
-      console.warn('Whisper API error:', data.error.message);
-      return;
-    }
-    if (data.text && data.text.trim() && !isHallucination(data.text)) {
-      let finalText = data.text.trim();
-
-      // If source language is not Spanish, translate to Spanish via GPT
-      if (lang !== 'es') {
-        finalText = await translateToSpanish(key, finalText, lang);
-        if (!finalText) return;
-      }
-
-      // Save transcript through background (offscreen can't access chrome.storage)
-      await chrome.runtime.sendMessage({
-        target: 'background',
-        action: 'saveTranscript',
-        text: finalText + ' '
-      });
-    }
-  } catch (e) {
-    console.warn('Whisper transcription error:', e);
-  }
-}
-
-async function translateToSpanish(apiKey, text, sourceLang) {
-  try {
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: 'Sos un traductor. Traducí el texto al español. Devolvé SOLO la traducción, sin explicaciones ni texto adicional. Mantené el tono y estilo original.'
-          },
-          {
-            role: 'user',
-            content: text
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 1024
-      })
-    });
-    const data = await resp.json();
-    if (data.error) {
-      console.warn('Translation API error:', data.error.message);
-      return text; // Fallback: return original text
-    }
-    return data.choices?.[0]?.message?.content?.trim() || text;
-  } catch (e) {
-    console.warn('Translation error:', e);
-    return text; // Fallback: return original text
-  }
+  }, captureSessionContext.chunkIntervalMs || DEFAULT_TRANSCRIPTION_CHUNK_MS);
 }
 
 function stopTranscriptionCapture() {
@@ -321,22 +257,37 @@ function stopTranscriptionCapture() {
 
   // Stop the current recorder (fires onstop → may enqueue final chunk)
   if (transcriptionRecorder && transcriptionRecorder.state !== 'inactive') {
+    pendingChunkStop += 1;
     transcriptionRecorder.stop();
   }
   transcriptionRecorder = null;
 
   // Return a promise that resolves when the queue finishes processing
-  if (transcriptionQueue.length > 0 || isProcessingQueue) {
+  if (pendingChunkStop > 0 || transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
     return new Promise((resolve) => {
       queueDrainResolve = resolve;
       // Safety timeout: don't block stop forever (max 30s for pending API calls)
       setTimeout(() => {
         if (queueDrainResolve) {
+          captureSessionContext = {
+            sessionId: null,
+            language: 'es',
+            activeProvider: null,
+            nextChunkIndex: 0,
+            chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+          };
           queueDrainResolve();
           queueDrainResolve = null;
         }
       }, 30000);
     });
   }
+  captureSessionContext = {
+    sessionId: null,
+    language: 'es',
+    activeProvider: null,
+    nextChunkIndex: 0,
+    chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
   return Promise.resolve();
 }

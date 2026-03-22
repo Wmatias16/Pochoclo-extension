@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Pochocla - Transcriptor",
+  "name": "Pochoclo - Transcriptor",
   "description": "Extensión de transcripción de audio y video para Chrome.",
   "version": "1.0.0",
   "icons": {
@@ -15,7 +15,7 @@
       "48": "icons/logo.png",
       "128": "icons/logo.png"
     },
-    "default_title": "Pochocla - Transcriptor"
+    "default_title": "Pochoclo - Transcriptor"
   },
   "permissions": [
     "activeTab",
@@ -26,7 +26,13 @@
     "downloads"
   ],
   "host_permissions": [
-    "https://api.openai.com/*"
+    "https://api.openai.com/*",
+    "https://api.deepgram.com/*",
+    "https://api.assemblyai.com/*",
+    "https://api.groq.com/*",
+    "https://speech.googleapis.com/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
   ],
   "background": {
     "service_worker": "background.js"

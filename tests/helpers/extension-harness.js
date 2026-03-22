@@ -8,6 +8,7 @@ const providerSettingsStore = require('../../storage/settings.js');
 const transcriptionStore = require('../../storage/transcriptions.js');
 const chunkProcessor = require('../../runtime/chunk-processor.js');
 const offscreenBridge = require('../../runtime/offscreen-bridge.js');
+const transcriptionSummarizer = require('../../runtime/transcription-summarizer.js');
 
 const BACKGROUND_PATH = path.resolve(__dirname, '..', '..', 'background.js');
 const OFFSCREEN_PATH = path.resolve(__dirname, '..', '..', 'offscreen.js');
@@ -248,6 +249,16 @@ class FakeMediaRecorder {
 
 function createAdapter(providerId, behavior = {}) {
   const adapter = {
+    async summarizeText(input, deps) {
+      if (typeof behavior.summarizeText === 'function') {
+        return behavior.summarizeText(input, deps);
+      }
+
+      return {
+        summary: `${providerId} summary`,
+        key_points: [`${providerId} point 1`, `${providerId} point 2`, `${providerId} point 3`]
+      };
+    },
     async transcribe(input, deps) {
       if (typeof behavior.transcribe === 'function') {
         return behavior.transcribe(input, deps);
@@ -322,6 +333,7 @@ function createHarness(options = {}) {
     PochoclaProviderSessionRuntime: global.PochoclaProviderSessionRuntime,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
     PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    PochoclaTranscriptionSummarizer: global.PochoclaTranscriptionSummarizer,
     PochoclaOpenAIAdapter: global.PochoclaOpenAIAdapter,
     PochoclaDeepgramAdapter: global.PochoclaDeepgramAdapter,
     PochoclaAssemblyAIAdapter: global.PochoclaAssemblyAIAdapter,
@@ -373,6 +385,7 @@ function createHarness(options = {}) {
   setGlobalValue('PochoclaProviderSessionRuntime', providerSessionRuntime);
   setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  setGlobalValue('PochoclaTranscriptionSummarizer', transcriptionSummarizer);
   setGlobalValue('PochoclaOpenAIAdapter', createAdapter('openai', adapterBehaviors.openai));
   setGlobalValue('PochoclaDeepgramAdapter', createAdapter('deepgram', adapterBehaviors.deepgram));
   setGlobalValue('PochoclaAssemblyAIAdapter', createAdapter('assemblyai', adapterBehaviors.assemblyai));
@@ -431,6 +444,13 @@ function createHarness(options = {}) {
     return savedTranscriptions || [];
   }
 
+  async function getTranscriptions() {
+    return chrome.runtime.sendMessage({
+      target: 'background',
+      action: 'getTranscriptions'
+    });
+  }
+
   async function dispatchChunk(input = {}) {
     const session = await getTranscriptSession();
     return offscreenBridge.dispatchChunkToBackground({
@@ -440,6 +460,14 @@ function createHarness(options = {}) {
         chunkIndex: Number.isFinite(Number(input.chunkIndex)) ? Number(input.chunkIndex) : 0
       },
       sendMessage: chrome.runtime.sendMessage
+    });
+  }
+
+  async function summarizeTranscription(id) {
+    return chrome.runtime.sendMessage({
+      target: 'background',
+      action: 'summarizeTranscription',
+      id
     });
   }
 
@@ -462,7 +490,9 @@ function createHarness(options = {}) {
     getTranscriptSession,
     getTranscript,
     getSavedTranscriptions,
+    getTranscriptions,
     dispatchChunk,
+    summarizeTranscription,
     dispose
   };
 }

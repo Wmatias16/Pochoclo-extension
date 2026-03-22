@@ -60,6 +60,89 @@ test('normalizeSavedTranscription keeps backward compatibility for legacy openai
   assert.equal(normalized.resolvedProvider, 'openai');
   assert.equal(normalized.status, 'completed');
   assert.equal(normalized.providerAudit, null);
+  assert.equal(normalized.summary, null);
+});
+
+test('normalizeSavedTranscription preserves a valid persisted summary payload', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_summary',
+    title: 'Resumen',
+    text: 'hola mundo',
+    summary: {
+      version: 1,
+      status: 'ready',
+      short: 'Resumen corto.',
+      keyPoints: ['Punto 1', 'Punto 2', 'Punto 3'],
+      model: 'gpt-4o-mini',
+      updatedAt: 123,
+      sourceTextHash: 'abc123',
+      error: null
+    }
+  });
+
+  assert.deepEqual(normalized.summary, {
+    version: 1,
+    status: 'ready',
+    short: 'Resumen corto.',
+    keyPoints: ['Punto 1', 'Punto 2', 'Punto 3'],
+    model: 'gpt-4o-mini',
+    updatedAt: 123,
+    sourceTextHash: 'abc123',
+    error: null
+  });
+});
+
+test('normalizeSavedTranscription sanitizes malformed summary payloads to null', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_bad_summary',
+    title: 'Resumen roto',
+    text: 'hola mundo',
+    summary: {
+      version: 'bad',
+      status: 'ready',
+      short: '   ',
+      keyPoints: 'no-array',
+      sourceTextHash: '',
+      error: null
+    }
+  });
+
+  assert.equal(normalized.summary, null);
+});
+
+test('normalizeSavedTranscription preserves error summaries for retry-safe reloads', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_error_summary',
+    title: 'Resumen con error',
+    text: 'hola mundo',
+    summary: {
+      version: 1,
+      status: 'error',
+      short: '',
+      keyPoints: [],
+      model: 'gpt-4o-mini',
+      updatedAt: 456,
+      sourceTextHash: 'hash-error',
+      error: {
+        code: 'timeout',
+        message: 'El provider tardó demasiado en generar el resultado. Probá nuevamente.'
+      }
+    }
+  });
+
+  assert.deepEqual(normalized.summary, {
+    version: 1,
+    status: 'error',
+    short: '',
+    keyPoints: [],
+    model: 'gpt-4o-mini',
+    updatedAt: 456,
+    sourceTextHash: 'hash-error',
+    error: {
+      code: 'timeout',
+      message: 'El provider tardó demasiado en generar el resultado. Probá nuevamente.'
+    }
+  });
 });
 
 test('normalizeSavedTranscriptions preserves provider audit and failure summaries after reload', () => {

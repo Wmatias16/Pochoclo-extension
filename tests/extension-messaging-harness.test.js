@@ -387,3 +387,301 @@ test('OpenAI chunk payload survives runtime messaging serialization before adapt
   assert.equal(chunkResult.ok, true);
   assert.equal(chunkResult.providerId, 'openai');
 });
+
+test('summarizeTranscription fails fast on missing_api_key, not_found, and empty_text', { concurrency: false }, async (t) => {
+  const settingsWithoutApiKey = createBaseSettings();
+  settingsWithoutApiKey.providers.openai.apiKey = '';
+
+  const missingKeyHarness = createHarness({
+    initialStorage: {
+      providerSettings: settingsWithoutApiKey,
+      savedTranscriptions: [{ id: 'tx_missing_key', title: 'Missing key', text: 'Texto disponible.' }]
+    }
+  });
+  t.after(() => missingKeyHarness.dispose());
+
+  const missingKeyResult = await missingKeyHarness.summarizeTranscription('tx_missing_key');
+  assert.equal(missingKeyResult.ok, false);
+  assert.equal(missingKeyResult.code, 'missing_api_key');
+  assert.equal(missingKeyResult.retryable, false);
+
+  const notFoundHarness = createHarness({
+    initialStorage: {
+      providerSettings: createBaseSettings(),
+      savedTranscriptions: []
+    }
+  });
+  t.after(() => notFoundHarness.dispose());
+
+  const notFoundResult = await notFoundHarness.summarizeTranscription('tx_missing');
+  assert.equal(notFoundResult.ok, false);
+  assert.equal(notFoundResult.code, 'not_found');
+  assert.equal(notFoundResult.retryable, false);
+
+  const emptyTextHarness = createHarness({
+    initialStorage: {
+      providerSettings: createBaseSettings(),
+      savedTranscriptions: [{ id: 'tx_empty', title: 'Empty', text: '   ' }]
+    }
+  });
+  t.after(() => emptyTextHarness.dispose());
+
+  const emptyTextResult = await emptyTextHarness.summarizeTranscription('tx_empty');
+  assert.equal(emptyTextResult.ok, false);
+  assert.equal(emptyTextResult.code, 'empty_text');
+  assert.equal(emptyTextResult.retryable, false);
+});
+
+test('summarizeTranscription dedupes in-flight jobs and returns summary payload to popup', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  let summarizeCalls = 0;
+  let releaseSummary = () => {};
+  const summaryGate = new Promise((resolve) => {
+    releaseSummary = resolve;
+  });
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{ id: 'tx_summary', title: 'Resumen', text: 'Texto para resumir.' }]
+    },
+    adapterBehaviors: {
+      openai: {
+        summarizeText: async () => {
+          summarizeCalls += 1;
+          await summaryGate;
+          return {
+            summary: 'Resumen corto generado.',
+            key_points: ['Punto 1', 'Punto 2', 'Punto 3']
+          };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const firstRequest = harness.summarizeTranscription('tx_summary');
+
+  const duplicateResult = await harness.summarizeTranscription('tx_summary');
+  assert.equal(duplicateResult.ok, false);
+  assert.equal(duplicateResult.code, 'summary_in_progress');
+  assert.equal(duplicateResult.retryable, true);
+
+  assert.equal(typeof releaseSummary, 'function');
+
+  releaseSummary();
+
+  const successResult = await firstRequest;
+  assert.equal(successResult.ok, true);
+  assert.equal(successResult.transcription.id, 'tx_summary');
+  assert.equal(successResult.transcription.summary.short, 'Resumen corto generado.');
+  assert.deepEqual(successResult.transcription.summary.keyPoints, ['Punto 1', 'Punto 2', 'Punto 3']);
+  assert.equal(successResult.transcription.summary.status, 'ready');
+  assert.equal(successResult.transcription.summary.version, 1);
+  assert.equal(typeof successResult.transcription.summary.updatedAt, 'number');
+  assert.equal(typeof successResult.transcription.summary.sourceTextHash, 'string');
+  assert.ok(successResult.transcription.summary.sourceTextHash.length > 0);
+  assert.equal(successResult.transcription.summary.error, null);
+  assert.equal(summarizeCalls, 1);
+
+  const savedTranscriptions = await harness.getSavedTranscriptions();
+  assert.equal(savedTranscriptions.length, 1);
+  assert.deepEqual(savedTranscriptions[0].summary, successResult.transcription.summary);
+});
+
+test('summarizeTranscription persists retryable error payloads on the saved transcription entry', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{ id: 'tx_summary_error', title: 'Resumen', text: 'Texto para resumir.' }]
+    },
+    adapterBehaviors: {
+      openai: {
+        async summarizeText() {
+          return {
+            summary: '   ',
+            key_points: []
+          };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const result = await harness.summarizeTranscription('tx_summary_error');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid_payload');
+  assert.equal(result.retryable, true);
+
+  const savedTranscriptions = await harness.getSavedTranscriptions();
+  assert.equal(savedTranscriptions.length, 1);
+  assert.deepEqual(savedTranscriptions[0].summary.error, {
+    code: 'invalid_payload',
+    message: 'El payload de resumen no incluye un summary válido.'
+  });
+  assert.equal(savedTranscriptions[0].summary.status, 'error');
+  assert.equal(savedTranscriptions[0].summary.version, 1);
+  assert.equal(savedTranscriptions[0].summary.short, '');
+  assert.deepEqual(savedTranscriptions[0].summary.keyPoints, []);
+  assert.equal(savedTranscriptions[0].summary.model, 'gpt-4o-mini');
+  assert.equal(typeof savedTranscriptions[0].summary.updatedAt, 'number');
+  assert.equal(typeof savedTranscriptions[0].summary.sourceTextHash, 'string');
+  assert.ok(savedTranscriptions[0].summary.sourceTextHash.length > 0);
+});
+
+test('summarizeTranscription maps provider timeouts to retryable persisted errors', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{ id: 'tx_summary_timeout', title: 'Resumen timeout', text: 'Texto para resumir.' }]
+    },
+    adapterBehaviors: {
+      openai: {
+        async summarizeText() {
+          const error = new Error('The operation timed out.');
+          error.code = 'timeout';
+          error.status = 504;
+          throw error;
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const result = await harness.summarizeTranscription('tx_summary_timeout');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'timeout');
+  assert.equal(result.retryable, true);
+
+  const savedTranscriptions = await harness.getSavedTranscriptions();
+  assert.deepEqual(savedTranscriptions[0].summary.error, {
+    code: 'timeout',
+    message: 'The operation timed out.'
+  });
+});
+
+test('summarizeTranscription exposes loading meta after popup reopen and clears it once completed', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  let releaseSummary;
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{ id: 'tx_summary_reload', title: 'Resumen reload', text: 'Texto para resumir.' }]
+    },
+    adapterBehaviors: {
+      openai: {
+        summarizeText: async () => {
+          await new Promise((resolve) => {
+            releaseSummary = resolve;
+          });
+          return {
+            summary: 'Resumen después de reopen.',
+            key_points: ['Punto 1', 'Punto 2', 'Punto 3']
+          };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const pendingRequest = harness.summarizeTranscription('tx_summary_reload');
+
+  for (let attempt = 0; attempt < 20 && typeof releaseSummary !== 'function'; attempt += 1) {
+    await Promise.resolve();
+  }
+
+  const reloadedList = await harness.getTranscriptions();
+  assert.equal(reloadedList[0].summaryMeta.isLoading, true);
+
+  releaseSummary();
+  await pendingRequest;
+
+  const refreshedList = await harness.getTranscriptions();
+  assert.equal(refreshedList[0].summaryMeta.isLoading, false);
+  assert.equal(refreshedList[0].summary.short, 'Resumen después de reopen.');
+});
+
+test('getTranscriptions marks persisted summaries as stale when source text changes', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{
+        id: 'tx_summary_stale',
+        title: 'Resumen stale',
+        text: 'Texto actualizado.',
+        summary: {
+          version: 1,
+          status: 'ready',
+          short: 'Resumen viejo.',
+          keyPoints: ['Punto 1', 'Punto 2'],
+          model: 'gpt-4o-mini',
+          updatedAt: Date.now(),
+          sourceTextHash: 'hash-viejo',
+          error: null
+        }
+      }]
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const list = await harness.getTranscriptions();
+  assert.equal(list[0].summaryMeta.isStale, true);
+  assert.equal(list[0].summaryMeta.isLoading, false);
+});
+
+test('summarizeTranscription switches to map-reduce for long texts and persists final summary shape', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  const longText = [
+    'Primer bloque con suficiente contenido para superar el threshold configurado en runtime y mantener una unidad temática clara. '.repeat(140),
+    'Segundo bloque con más decisiones, contexto y acuerdos para forzar múltiples chunks sin romper el contrato final. '.repeat(140),
+    'Tercer bloque para que el reduce consolide todos los parciales y devuelva una única síntesis usable. '.repeat(140)
+  ].join('\n\n');
+  const calls = [];
+
+  const harness = createHarness({
+    initialStorage: {
+      providerSettings: settings,
+      savedTranscriptions: [{ id: 'tx_summary_long', title: 'Resumen largo', text: longText }]
+    },
+    adapterBehaviors: {
+      openai: {
+        async summarizeText({ messages }) {
+          calls.push(messages);
+
+          if (calls.length < 4) {
+            return {
+              summary: `Resumen parcial ${calls.length}.`,
+              key_points: [`Punto ${calls.length}.1`, `Punto ${calls.length}.2`, `Punto ${calls.length}.3`]
+            };
+          }
+
+          return {
+            summary: 'Resumen largo consolidado.',
+            key_points: ['Idea 1', 'Idea 2', 'Idea 3']
+          };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const result = await harness.summarizeTranscription('tx_summary_long');
+  assert.equal(result.ok, true);
+  assert.equal(result.transcription.summary.status, 'ready');
+  assert.equal(result.transcription.summary.short, 'Resumen largo consolidado.');
+  assert.deepEqual(result.transcription.summary.keyPoints, ['Idea 1', 'Idea 2', 'Idea 3']);
+  assert.ok(calls.length > 1);
+  assert.match(calls[0][0].content, /chunk/i);
+  assert.match(calls[calls.length - 1][0].content, /consolida/i);
+
+  const savedTranscriptions = await harness.getSavedTranscriptions();
+  assert.equal(savedTranscriptions[0].summary.short, 'Resumen largo consolidado.');
+  assert.deepEqual(savedTranscriptions[0].summary.keyPoints, ['Idea 1', 'Idea 2', 'Idea 3']);
+});

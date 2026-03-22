@@ -116,8 +116,86 @@
     };
   }
 
+  function normalizeSummaryError(summaryError) {
+    if (!summaryError || typeof summaryError !== 'object') {
+      return null;
+    }
+
+    const code = hasText(summaryError.code) ? summaryError.code.trim() : null;
+    const message = hasText(summaryError.message) ? summaryError.message.trim() : null;
+
+    if (!code || !message) {
+      return null;
+    }
+
+    return { code, message };
+  }
+
+  function normalizeTranscriptionSummary(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return null;
+    }
+
+    const status = hasText(summary.status) ? summary.status.trim() : '';
+    if (status !== 'ready' && status !== 'error') {
+      return null;
+    }
+
+    const version = Number(summary.version);
+    if (!Number.isFinite(version) || version < 1) {
+      return null;
+    }
+
+    const updatedAt = Number(summary.updatedAt);
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) {
+      return null;
+    }
+
+    const sourceTextHash = hasText(summary.sourceTextHash) ? summary.sourceTextHash.trim() : '';
+    if (!sourceTextHash) {
+      return null;
+    }
+
+    const short = typeof summary.short === 'string' ? summary.short.trim() : '';
+    const keyPoints = Array.isArray(summary.keyPoints)
+      ? summary.keyPoints
+        .map((item) => (typeof item === 'string' ? item.trim() : ''))
+        .filter(Boolean)
+      : null;
+
+    if (!keyPoints) {
+      return null;
+    }
+
+    const error = normalizeSummaryError(summary.error);
+
+    if (status === 'ready') {
+      if (!short || keyPoints.length === 0 || error !== null) {
+        return null;
+      }
+    }
+
+    if (status === 'error') {
+      if (!error) {
+        return null;
+      }
+    }
+
+    return {
+      version,
+      status,
+      short,
+      keyPoints,
+      model: hasText(summary.model) ? summary.model.trim() : null,
+      updatedAt,
+      sourceTextHash,
+      error
+    };
+  }
+
   function normalizeSavedTranscription(entry = {}) {
     const providerAudit = normalizeProviderAudit(entry.providerAudit, entry);
+    const summary = normalizeTranscriptionSummary(entry.summary);
     const resolvedProvider = hasText(entry.resolvedProvider)
       ? entry.resolvedProvider.trim()
       : (providerAudit && hasText(providerAudit.resolvedProvider) ? providerAudit.resolvedProvider.trim() : 'openai');
@@ -128,7 +206,8 @@
       text: typeof entry.text === 'string' ? entry.text : '',
       resolvedProvider,
       status,
-      providerAudit
+      providerAudit,
+      summary
     };
   }
 
@@ -160,6 +239,7 @@
   return {
     createProviderAuditSnapshot,
     normalizeProviderAudit,
+    normalizeTranscriptionSummary,
     normalizeSavedTranscription,
     normalizeSavedTranscriptions
   };

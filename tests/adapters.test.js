@@ -48,6 +48,99 @@ test('openai adapter shapes multipart request and optional translation', async (
   assert.equal(result.translated, true);
 });
 
+test('openai adapter summarizes text with chat completions JSON mode', async () => {
+  const result = await openai.summarizeText(
+    {
+      text: 'Texto largo para resumir.',
+      settings: { apiKey: 'sk-openai', summaryModel: 'gpt-4o-mini' },
+      messages: [
+        { role: 'system', content: 'Instrucciones del sistema' },
+        { role: 'user', content: 'Texto largo para resumir.' }
+      ]
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.equal(url, 'https://api.openai.com/v1/chat/completions');
+        assert.equal(options.method, 'POST');
+        assert.equal(options.headers.Authorization, 'Bearer sk-openai');
+        assert.equal(options.headers['Content-Type'], 'application/json');
+
+        const body = JSON.parse(options.body);
+        assert.equal(body.model, 'gpt-4o-mini');
+        assert.equal(body.response_format.type, 'json_object');
+        assert.equal(body.temperature, 0.2);
+        assert.equal(body.max_tokens, 600);
+        assert.deepEqual(body.messages, [
+          { role: 'system', content: 'Instrucciones del sistema' },
+          { role: 'user', content: 'Texto largo para resumir.' }
+        ]);
+
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  summary: 'Resumen breve.',
+                  key_points: ['Punto 1', 'Punto 2']
+                })
+              }
+            }
+          ]
+        });
+      }
+    }
+  );
+
+  assert.deepEqual(result, {
+    summary: 'Resumen breve.',
+    key_points: ['Punto 1', 'Punto 2']
+  });
+});
+
+test('openai adapter maps aborted summary requests to timeout errors', async () => {
+  await assert.rejects(
+    () => openai.summarizeText(
+      {
+        text: 'Texto largo para resumir.',
+        settings: { apiKey: 'sk-openai', summaryModel: 'gpt-4o-mini', summaryTimeoutMs: 5 },
+        messages: [
+          { role: 'system', content: 'Instrucciones del sistema' },
+          { role: 'user', content: 'Texto largo para resumir.' }
+        ]
+      },
+      {
+        fetchImpl: async (url, options) => {
+          if (options.signal && options.signal.aborted) {
+            const abortError = new Error('The operation was aborted.');
+            abortError.name = 'AbortError';
+            throw abortError;
+          }
+
+          await Promise.resolve();
+
+          if (options.signal && options.signal.aborted) {
+            const abortError = new Error('The operation was aborted.');
+            abortError.name = 'AbortError';
+            throw abortError;
+          }
+
+          return jsonResponse({ ok: true });
+        },
+        setTimeoutImpl: (callback) => {
+          callback();
+          return { done: true };
+        },
+        clearTimeoutImpl: () => {}
+      }
+    ),
+    (error) => {
+      assert.equal(error.code, 'timeout');
+      assert.equal(error.status, 504);
+      return true;
+    }
+  );
+});
+
 test('deepgram adapter sends raw audio and extracts transcript', async () => {
   const blob = new Blob(['audio'], { type: 'audio/webm' });
   const result = await deepgram.transcribe(

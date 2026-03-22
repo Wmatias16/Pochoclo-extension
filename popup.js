@@ -33,6 +33,14 @@ const detailMeta = document.getElementById('detailMeta');
 const detailUrl = document.getElementById('detailUrl');
 const detailAudit = document.getElementById('detailAudit');
 const detailText = document.getElementById('detailText');
+const detailSummarySection = document.getElementById('detailSummarySection');
+const detailSummaryStatus = document.getElementById('detailSummaryStatus');
+const detailSummaryBadge = document.getElementById('detailSummaryBadge');
+const detailSummaryCard = document.getElementById('detailSummaryCard');
+const detailSummaryText = document.getElementById('detailSummaryText');
+const detailSummaryKeyPoints = document.getElementById('detailSummaryKeyPoints');
+const detailSummaryError = document.getElementById('detailSummaryError');
+const btnDetailSummarize = document.getElementById('btnDetailSummarize');
 const btnSaveTitle = document.getElementById('btnSaveTitle');
 const btnDetailCopy = document.getElementById('btnDetailCopy');
 const btnDetailDelete = document.getElementById('btnDetailDelete');
@@ -42,9 +50,13 @@ const historyCount = document.getElementById('historyCount');
 
 let currentView = 'recorder';
 let currentDetailId = null;
+let currentDetailItem = null;
 let providerCatalog = [];
 let providerSettingsState = null;
 let liveSessionState = null;
+let detailSummaryRequest = { id: null, status: 'idle', error: null };
+
+const popupSummaryUi = globalThis.PochoclaPopupSummaryUI || null;
 
 let timerInterval = null;
 let waveformInterval = null;
@@ -168,6 +180,10 @@ function formatDuration(sec) {
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return m > 0 ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`;
+}
+
+function cloneValue(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
 function getProviderLabel(providerId) {
@@ -334,6 +350,80 @@ function getHistoryProviderSummary(item) {
   }
 
   return resolvedProvider;
+}
+
+function setCurrentDetailItem(item) {
+  currentDetailItem = item ? cloneValue(item) : null;
+  currentDetailId = currentDetailItem ? currentDetailItem.id : null;
+}
+
+function setDetailSummaryRequest(nextState = {}) {
+  detailSummaryRequest = {
+    id: nextState.id || null,
+    status: nextState.status || 'idle',
+    error: nextState.error || null
+  };
+}
+
+async function getTranscriptionById(id) {
+  if (!hasText(id)) return null;
+  const list = await sendBg('getTranscriptions');
+  return Array.isArray(list) ? list.find((entry) => entry && entry.id === id) || null : null;
+}
+
+function getSummaryViewModel(item) {
+  if (popupSummaryUi && typeof popupSummaryUi.createSummaryViewModel === 'function') {
+    return popupSummaryUi.createSummaryViewModel({
+      transcription: item,
+      request: detailSummaryRequest.id === (item && item.id)
+        ? detailSummaryRequest
+        : { id: item && item.id, status: 'idle', error: null }
+    });
+  }
+
+  return {
+    state: 'idle',
+    canSummarize: hasText(item && item.text),
+    actionLabel: 'Resumir',
+    actionDisabled: !hasText(item && item.text),
+    statusText: 'Generá una síntesis corta con los puntos más importantes.',
+    showCard: false,
+    short: '',
+    keyPoints: [],
+    errorMessage: ''
+  };
+}
+
+function renderDetailSummary(item) {
+  if (!detailSummarySection) return;
+
+  const viewModel = getSummaryViewModel(item);
+  detailSummarySection.hidden = false;
+  detailSummaryStatus.textContent = viewModel.statusText;
+   if (detailSummaryBadge) {
+     detailSummaryBadge.hidden = !viewModel.showStaleBadge;
+     detailSummaryBadge.textContent = viewModel.staleBadgeText || 'Resumen desactualizado';
+   }
+  btnDetailSummarize.textContent = viewModel.actionLabel;
+  btnDetailSummarize.disabled = !!viewModel.actionDisabled;
+
+  detailSummaryCard.hidden = !viewModel.showCard;
+  detailSummaryCard.classList.toggle('error', viewModel.state === 'error');
+
+  detailSummaryText.hidden = !(viewModel.showCard && hasText(viewModel.short));
+  detailSummaryText.textContent = viewModel.short || '';
+
+  detailSummaryError.hidden = !(viewModel.showCard && hasText(viewModel.errorMessage));
+  detailSummaryError.textContent = viewModel.errorMessage || '';
+
+  const keyPoints = Array.isArray(viewModel.keyPoints) ? viewModel.keyPoints : [];
+  detailSummaryKeyPoints.hidden = !(viewModel.showCard && keyPoints.length > 0);
+  detailSummaryKeyPoints.innerHTML = '';
+  keyPoints.forEach((point) => {
+    const li = document.createElement('li');
+    li.textContent = point;
+    detailSummaryKeyPoints.appendChild(li);
+  });
 }
 
 function showView(view) {
@@ -1088,7 +1178,8 @@ async function loadHistory() {
 
 // ── Detail view ──
 function openDetail(item) {
-  currentDetailId = item.id;
+  setCurrentDetailItem(item);
+  setDetailSummaryRequest({ id: item.id, status: 'idle', error: null });
   detailTitle.value = item.title;
   detailTitle.dataset.original = item.title;
   btnSaveTitle.classList.remove('visible');
@@ -1110,6 +1201,7 @@ function openDetail(item) {
   detailUrl.textContent = hostname;
   detailUrl.style.display = hostname ? 'block' : 'none';
   detailText.textContent = item.text || 'La transcripción no generó texto final.';
+  renderDetailSummary(currentDetailItem);
   renderAuditDetail(item);
   showView('detail');
 }
@@ -1137,11 +1229,90 @@ btnDetailCopy.addEventListener('click', () => {
   });
 });
 
+btnDetailSummarize.addEventListener('click', async () => {
+  if (!currentDetailItem || !hasText(currentDetailItem.id)) return;
+  if (detailSummaryRequest.id === currentDetailItem.id && detailSummaryRequest.status === 'loading') return;
+
+  const transcriptionId = currentDetailItem.id;
+  setDetailSummaryRequest({ id: transcriptionId, status: 'loading', error: null });
+  renderDetailSummary(currentDetailItem);
+
+  try {
+    const response = await sendBg('summarizeTranscription', { id: transcriptionId });
+
+    if (response && response.ok && response.transcription) {
+      if (currentDetailId === transcriptionId) {
+        setCurrentDetailItem(response.transcription);
+        setDetailSummaryRequest({ id: transcriptionId, status: 'idle', error: null });
+        renderDetailSummary(currentDetailItem);
+        renderAuditDetail(currentDetailItem);
+        showToast('Resumen listo');
+      }
+      return;
+    }
+
+    const shouldRefresh = !!(
+      response
+      && (response.retryable || response.code === 'summary_in_progress')
+    );
+
+    const refreshed = shouldRefresh ? await getTranscriptionById(transcriptionId) : null;
+
+    if (currentDetailId !== transcriptionId) {
+      setDetailSummaryRequest({ id: transcriptionId, status: 'idle', error: null });
+      return;
+    }
+
+    if (refreshed) {
+      setCurrentDetailItem(refreshed);
+      setDetailSummaryRequest({
+        id: transcriptionId,
+        status: response && response.code === 'summary_in_progress' ? 'loading' : 'idle',
+        error: null
+      });
+      renderDetailSummary(currentDetailItem);
+      renderAuditDetail(currentDetailItem);
+      if (response && response.code === 'summary_in_progress') {
+        showToast('Ya hay un resumen en progreso');
+      }
+      return;
+    }
+
+    setDetailSummaryRequest({
+      id: transcriptionId,
+      status: 'idle',
+      error: {
+        message: (response && response.error) || 'No se pudo generar el resumen.',
+        code: response && response.code ? response.code : 'provider_error',
+        retryable: !!(response && response.retryable)
+      }
+    });
+    renderDetailSummary(currentDetailItem);
+  } catch (error) {
+    if (currentDetailId !== transcriptionId) {
+      setDetailSummaryRequest({ id: transcriptionId, status: 'idle', error: null });
+      return;
+    }
+
+    setDetailSummaryRequest({
+      id: transcriptionId,
+      status: 'idle',
+      error: {
+        message: hasText(error && error.message) ? error.message : 'No se pudo generar el resumen.',
+        code: error && error.code ? error.code : 'provider_error',
+        retryable: false
+      }
+    });
+    renderDetailSummary(currentDetailItem);
+  }
+});
+
 btnDetailDelete.addEventListener('click', async () => {
   if (!currentDetailId) return;
   if (!confirm('¿Eliminar esta transcripción?')) return;
   await sendBg('deleteTranscription', { id: currentDetailId });
-  currentDetailId = null;
+  setCurrentDetailItem(null);
+  setDetailSummaryRequest({ id: null, status: 'idle', error: null });
   showView('history');
   loadHistory();
   showToast('Transcripción eliminada');

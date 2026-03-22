@@ -11,6 +11,7 @@ if (typeof importScripts === 'function') {
     'storage/transcriptions.js',
     'providers/adapters/shared.js',
     'providers/adapters/openai.js',
+    'runtime/transcription-summarizer.js',
     'providers/adapters/deepgram.js',
     'providers/adapters/assemblyai.js',
     'providers/adapters/groq.js',
@@ -27,6 +28,7 @@ const offscreenBridge = globalThis.PochoclaOffscreenBridge;
 const providerSettingsStore = globalThis.PochoclaProviderSettings;
 const transcriptionStore = globalThis.PochoclaTranscriptionStorage;
 const providerSessionRuntime = globalThis.PochoclaProviderSessionRuntime;
+const transcriptionSummarizer = globalThis.PochoclaTranscriptionSummarizer;
 const providerAdapters = {
   openai: globalThis.PochoclaOpenAIAdapter,
   deepgram: globalThis.PochoclaDeepgramAdapter,
@@ -53,6 +55,10 @@ function createScopedLogger(context) {
 // ── Serialized transcript writes (prevents race conditions) ──
 let saveChain = Promise.resolve();
 let processChunkChain = Promise.resolve();
+const activeSummaryJobs = new Map();
+
+const SUMMARY_JOB_STORAGE_KEY = 'summaryJobs';
+const SUMMARY_JOB_TTL_MS = 2 * 60 * 1000;
 
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const OPENAI_LIVE_TRANSCRIPTION_CHUNK_MS = 3000;
@@ -101,6 +107,454 @@ function getLiveTranscriptionChunkMs(providerId) {
   return providerId === 'openai'
     ? OPENAI_LIVE_TRANSCRIPTION_CHUNK_MS
     : DEFAULT_TRANSCRIPTION_CHUNK_MS;
+}
+
+function hasText(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function buildSummaryActionError(code, message, options = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = options.status || 500;
+  error.retryable = !!options.retryable;
+  return error;
+}
+
+function normalizeSummaryFailure(error) {
+  const errorCode = error && error.code ? error.code : '';
+  const retryableCodes = new Set(['summary_in_progress', 'invalid_payload', 'timeout', 'network', 'rate_limit', 'unavailable', 'provider_error']);
+
+  if (
+    errorCode === 'missing_api_key'
+    || errorCode === 'not_found'
+    || errorCode === 'empty_text'
+    || errorCode === 'summary_in_progress'
+    || errorCode === 'invalid_payload'
+    || errorCode === 'timeout'
+    || errorCode === 'network'
+    || errorCode === 'rate_limit'
+    || errorCode === 'unavailable'
+    || errorCode === 'auth'
+    || errorCode === 'unsupported'
+    || errorCode === 'provider_error'
+  ) {
+    return {
+      ok: false,
+      error: hasText(error && error.message) ? error.message : 'No se pudo generar el resumen.',
+      code: errorCode || 'provider_error',
+      retryable: typeof (error && error.retryable) === 'boolean'
+        ? !!error.retryable
+        : retryableCodes.has(errorCode || 'provider_error'),
+      status: Number.isFinite(Number(error && error.status)) ? Number(error.status) : 500
+    };
+  }
+
+  if (providerErrors && typeof providerErrors.normalizeProviderError === 'function') {
+    const normalized = providerErrors.normalizeProviderError(error, { providerId: 'openai' });
+    return {
+      ok: false,
+      error: normalized.summary || 'No se pudo generar el resumen.',
+      code: normalized.code || 'provider_error',
+      retryable: !!normalized.retryable,
+      status: Number.isFinite(Number(normalized.status)) ? Number(normalized.status) : 500
+    };
+  }
+
+  return {
+    ok: false,
+    error: hasText(error && error.message) ? error.message : 'No se pudo generar el resumen.',
+    code: 'provider_error',
+    retryable: false,
+    status: 500
+  };
+}
+
+function normalizeSummaryResultError(error) {
+  const normalized = normalizeSummaryFailure(error);
+  return {
+    ok: normalized.ok,
+    error: normalized.error,
+    code: normalized.code,
+    retryable: normalized.retryable
+  };
+}
+
+function buildReadySummaryPayload(summaryResult) {
+  return {
+    version: 1,
+    status: 'ready',
+    short: summaryResult.short,
+    keyPoints: Array.isArray(summaryResult.keyPoints) ? summaryResult.keyPoints.slice() : [],
+    model: summaryResult.model || null,
+    updatedAt: Date.now(),
+    sourceTextHash: summaryResult.sourceTextHash,
+    error: null
+  };
+}
+
+function getSummaryModelForPersistence(model) {
+  if (hasText(model)) {
+    return model.trim();
+  }
+
+  if (transcriptionSummarizer && hasText(transcriptionSummarizer.DEFAULT_SUMMARY_MODEL)) {
+    return transcriptionSummarizer.DEFAULT_SUMMARY_MODEL.trim();
+  }
+
+  return 'gpt-4o-mini';
+}
+
+async function buildErrorSummaryPayload(context, error) {
+  const normalizedError = normalizeSummaryFailure(error);
+  const sourceTextHash = transcriptionSummarizer && typeof transcriptionSummarizer.sourceTextHash === 'function'
+    ? await transcriptionSummarizer.sourceTextHash(context.text)
+    : null;
+
+  return {
+    version: 1,
+    status: 'error',
+    short: '',
+    keyPoints: [],
+    model: getSummaryModelForPersistence(context && context.model),
+    updatedAt: Date.now(),
+    sourceTextHash,
+    error: {
+      code: normalizedError.code,
+      message: normalizedError.error
+    }
+  };
+}
+
+function buildSummaryJob(transcriptionId) {
+  return {
+    transcriptionId,
+    requestId: `summary_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    startedAt: Date.now()
+  };
+}
+
+async function readSummaryJobs() {
+  const stored = await chrome.storage.local.get(SUMMARY_JOB_STORAGE_KEY);
+  const jobs = stored && stored[SUMMARY_JOB_STORAGE_KEY] && typeof stored[SUMMARY_JOB_STORAGE_KEY] === 'object'
+    ? stored[SUMMARY_JOB_STORAGE_KEY]
+    : {};
+
+  return { ...jobs };
+}
+
+function isStaleSummaryJob(job, now = Date.now()) {
+  if (!job || typeof job !== 'object') {
+    return true;
+  }
+
+  const startedAt = Number(job.startedAt);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) {
+    return true;
+  }
+
+  return (now - startedAt) > SUMMARY_JOB_TTL_MS;
+}
+
+async function writeSummaryJobs(jobs) {
+  await chrome.storage.local.set({ [SUMMARY_JOB_STORAGE_KEY]: jobs });
+}
+
+async function setPersistedSummaryJob(job) {
+  const jobs = await readSummaryJobs();
+  jobs[job.transcriptionId] = {
+    requestId: job.requestId,
+    startedAt: job.startedAt
+  };
+  await writeSummaryJobs(jobs);
+}
+
+async function clearPersistedSummaryJob(transcriptionId, requestId) {
+  const jobs = await readSummaryJobs();
+  const storedJob = jobs[transcriptionId];
+
+  if (!storedJob) {
+    return;
+  }
+
+  if (requestId && storedJob.requestId && storedJob.requestId !== requestId) {
+    return;
+  }
+
+  delete jobs[transcriptionId];
+  await writeSummaryJobs(jobs);
+}
+
+async function getActiveSummaryJob(transcriptionId, options = {}) {
+  if (!hasText(transcriptionId)) {
+    return null;
+  }
+
+  const jobs = await readSummaryJobs();
+  const job = jobs[transcriptionId];
+
+  if (!job) {
+    return null;
+  }
+
+  if (isStaleSummaryJob(job)) {
+    if (options.clearStale !== false) {
+      delete jobs[transcriptionId];
+      await writeSummaryJobs(jobs);
+      const summaryLogger = createScopedLogger({ scope: 'summary.generate', transcriptionId });
+      if (typeof summaryLogger.info === 'function') {
+        summaryLogger.info('summary.job-stale-cleared', { transcriptionId });
+      }
+    }
+
+    return null;
+  }
+
+  return {
+    transcriptionId,
+    requestId: job.requestId || null,
+    startedAt: Number(job.startedAt)
+  };
+}
+
+async function buildSummaryMeta(entry) {
+  const activeJob = await getActiveSummaryJob(entry && entry.id, { clearStale: true });
+  let isStale = false;
+  const summaryUpdatedAt = Number(entry && entry.summary && entry.summary.updatedAt);
+  const jobStillLoading = !!(
+    activeJob
+    && (!Number.isFinite(summaryUpdatedAt) || summaryUpdatedAt < activeJob.startedAt)
+  );
+
+  if (
+    entry
+    && entry.summary
+    && hasText(entry.summary.sourceTextHash)
+    && hasText(entry.text)
+    && transcriptionSummarizer
+    && typeof transcriptionSummarizer.sourceTextHash === 'function'
+  ) {
+    try {
+      const currentSourceTextHash = await transcriptionSummarizer.sourceTextHash(entry.text);
+      isStale = currentSourceTextHash !== entry.summary.sourceTextHash;
+    } catch (error) {
+      isStale = false;
+    }
+  }
+
+  return {
+    isLoading: jobStillLoading,
+    isStale,
+    activeRequestStartedAt: activeJob ? activeJob.startedAt : null
+  };
+}
+
+async function enrichTranscriptionForSummary(entry) {
+  const normalizedEntry = transcriptionStore && typeof transcriptionStore.normalizeSavedTranscription === 'function'
+    ? transcriptionStore.normalizeSavedTranscription(entry)
+    : entry;
+
+  return {
+    ...normalizedEntry,
+    summaryMeta: await buildSummaryMeta(normalizedEntry)
+  };
+}
+
+async function persistSummaryPayload(transcriptionId, summaryPayload) {
+  const { savedTranscriptions } = await chrome.storage.local.get('savedTranscriptions');
+  const list = Array.isArray(savedTranscriptions) ? savedTranscriptions.slice() : [];
+  const index = list.findIndex((entry) => entry && entry.id === transcriptionId);
+
+  if (index === -1) {
+    throw buildSummaryActionError('not_found', 'No encontramos la transcripción para resumir.', {
+      status: 404,
+      retryable: false
+    });
+  }
+
+  const nextEntry = {
+    ...list[index],
+    summary: summaryPayload
+  };
+
+  list[index] = transcriptionStore && typeof transcriptionStore.normalizeSavedTranscription === 'function'
+    ? transcriptionStore.normalizeSavedTranscription(nextEntry)
+    : nextEntry;
+
+  await chrome.storage.local.set({ savedTranscriptions: list });
+
+  return enrichTranscriptionForSummary(list[index]);
+}
+
+function getOpenAiSummarySettings(providerSettings = {}) {
+  return providerSettings && providerSettings.providers && providerSettings.providers.openai
+    ? providerSettings.providers.openai
+    : {};
+}
+
+async function loadSummaryRequestContext(id) {
+  const normalizedId = hasText(id) ? id.trim() : '';
+  const transcriptions = await getTranscriptions();
+  const transcription = transcriptions.find((entry) => entry && entry.id === normalizedId);
+
+  if (!transcription) {
+    throw buildSummaryActionError('not_found', 'No encontramos la transcripción para resumir.', {
+      status: 404,
+      retryable: false
+    });
+  }
+
+  const text = hasText(transcription.text) ? transcription.text.trim() : '';
+  if (!text) {
+    throw buildSummaryActionError('empty_text', 'La transcripción no tiene texto para resumir.', {
+      status: 422,
+      retryable: false
+    });
+  }
+
+  const providerSettings = await readProviderSettings();
+  const openaiSettings = getOpenAiSummarySettings(providerSettings);
+  const apiKey = hasText(openaiSettings.apiKey) ? openaiSettings.apiKey.trim() : '';
+
+  if (!apiKey) {
+    throw buildSummaryActionError('missing_api_key', 'Falta la API key de OpenAI para generar el resumen.', {
+      status: 422,
+      retryable: false
+    });
+  }
+
+  return {
+    transcription,
+    text,
+    apiKey,
+    model: hasText(openaiSettings.summaryModel) ? openaiSettings.summaryModel.trim() : undefined
+  };
+}
+
+async function executeSummaryRequest(context) {
+  const summaryLogger = createScopedLogger({
+    scope: 'summary.generate',
+    transcriptionId: context && context.transcription ? context.transcription.id : null
+  });
+
+  if (!transcriptionSummarizer || typeof transcriptionSummarizer.summarizeTranscription !== 'function') {
+    throw buildSummaryActionError('provider_error', 'No se pudo inicializar el runtime de resumen.', {
+      status: 500,
+      retryable: false
+    });
+  }
+
+  const summarizeText = providerAdapters.openai && typeof providerAdapters.openai.summarizeText === 'function'
+    ? providerAdapters.openai.summarizeText.bind(providerAdapters.openai)
+    : undefined;
+
+  const strategy = transcriptionSummarizer && typeof transcriptionSummarizer.selectSummaryStrategy === 'function'
+    ? transcriptionSummarizer.selectSummaryStrategy(context.text)
+    : 'single-pass';
+
+  if (typeof summaryLogger.info === 'function') {
+    summaryLogger.info('summary.started', {
+      transcriptionId: context.transcription.id,
+      textLength: context.text.length,
+      strategy,
+      hasPersistedSummary: !!(context.transcription && context.transcription.summary)
+    });
+  }
+
+  const summaryResult = await transcriptionSummarizer.summarizeTranscription({
+    text: context.text,
+    apiKey: context.apiKey,
+    model: context.model
+  }, {
+    fetchImpl: fetch.bind(globalThis),
+    summarizeText,
+    setTimeoutImpl: setTimeout,
+    clearTimeoutImpl: clearTimeout
+  });
+
+  if (typeof summaryLogger.info === 'function') {
+    summaryLogger.info('summary.completed', {
+      transcriptionId: context.transcription.id,
+      model: summaryResult.model,
+      keyPoints: summaryResult.keyPoints.length
+    });
+  }
+
+  const persistedTranscription = await persistSummaryPayload(
+    context.transcription.id,
+    buildReadySummaryPayload(summaryResult)
+  );
+
+  return {
+    ok: true,
+    transcription: persistedTranscription
+  };
+}
+
+async function handleSummarizeTranscription(id) {
+  const transcriptionId = hasText(id) ? id.trim() : '';
+
+  if (activeSummaryJobs.has(transcriptionId)) {
+    throw buildSummaryActionError('summary_in_progress', 'Ya hay un resumen en progreso para esta transcripción.', {
+      status: 409,
+      retryable: true
+    });
+  }
+
+  const summaryJob = buildSummaryJob(transcriptionId);
+
+  const job = Promise.resolve()
+    .then(async () => {
+      const persistedJob = await getActiveSummaryJob(transcriptionId, { clearStale: true });
+      if (persistedJob) {
+        throw buildSummaryActionError('summary_in_progress', 'Ya hay un resumen en progreso para esta transcripción.', {
+          status: 409,
+          retryable: true
+        });
+      }
+    })
+    .then(() => setPersistedSummaryJob(summaryJob))
+    .then(() => loadSummaryRequestContext(transcriptionId))
+    .then((context) => executeSummaryRequest(context))
+    .catch(async (error) => {
+      const summaryLogger = createScopedLogger({ scope: 'summary.generate', transcriptionId });
+      const normalizedError = normalizeSummaryFailure(error);
+      if (typeof summaryLogger.warn === 'function') {
+        summaryLogger.warn('summary.failed', {
+          transcriptionId,
+          code: normalizedError.code,
+          retryable: normalizedError.retryable,
+          status: normalizedError.status
+        });
+      }
+
+      if (normalizedError.code !== 'missing_api_key' && normalizedError.code !== 'not_found' && normalizedError.code !== 'empty_text') {
+        try {
+          const context = await loadSummaryRequestContext(transcriptionId);
+          const summaryPayload = await buildErrorSummaryPayload(context, error);
+          await persistSummaryPayload(transcriptionId, summaryPayload);
+        } catch (persistError) {
+          if (typeof summaryLogger.warn === 'function') {
+            summaryLogger.warn('summary.persist-failed', {
+              transcriptionId,
+              code: persistError && persistError.code ? persistError.code : 'provider_error'
+            });
+          }
+        }
+      }
+
+      throw error;
+    })
+    .finally(() => {
+      if (activeSummaryJobs.get(transcriptionId) === job) {
+        activeSummaryJobs.delete(transcriptionId);
+      }
+
+      return clearPersistedSummaryJob(transcriptionId, summaryJob.requestId);
+    });
+
+  activeSummaryJobs.set(transcriptionId, job);
+  return job;
 }
 
 function hydrateProcessChunkMessage(message = {}) {
@@ -304,6 +758,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'updateTranscription':
       updateTranscription(msg.id, msg.updates).then(r => sendResponse(r));
+      return true;
+
+    case 'summarizeTranscription':
+      handleSummarizeTranscription(msg.id)
+        .then(sendResponse)
+        .catch((error) => sendResponse(normalizeSummaryResultError(error)));
       return true;
   }
 });
@@ -628,7 +1088,7 @@ async function getTranscriptions() {
     await chrome.storage.local.set({ savedTranscriptions: normalized });
   }
 
-  return normalized;
+  return Promise.all(normalized.map((entry) => enrichTranscriptionForSummary(entry)));
 }
 
 async function deleteTranscription(id) {

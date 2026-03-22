@@ -31,3 +31,20 @@ test('popup keeps provider settings mount points for credential inputs', () => {
     assert.match(html, new RegExp(`id=["']${id}["']`), `missing #${id} in popup.html`);
   });
 });
+
+test('popup detail view exposes summary action and render mounts', () => {
+  const html = readPopupHtml();
+
+  [
+    'detailSummarySection',
+    'btnDetailSummarize',
+    'detailSummaryStatus',
+    'detailSummaryBadge',
+    'detailSummaryCard',
+    'detailSummaryText',
+    'detailSummaryKeyPoints',
+    'detailSummaryError'
+  ].forEach((id) => {
+    assert.match(html, new RegExp(`id=["']${id}["']`), `missing #${id} in popup.html`);
+  });
+});

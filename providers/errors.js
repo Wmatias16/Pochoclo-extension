@@ -33,10 +33,22 @@
   function inferErrorCode(error, options = {}) {
     const message = extractMessage(error).toLowerCase();
     const status = asStatus(error);
+    const errorName = String((error && error.name) || '').toLowerCase();
     const rawCode = String(
       (error && (error.code || error.errorCode || (error.error && error.error.code))) || ''
     ).toLowerCase();
     const providerId = options.providerId || '';
+
+    if (
+      errorName === 'aborterror'
+      || rawCode.includes('timeout')
+      || rawCode.includes('timedout')
+      || message.includes('timeout')
+      || message.includes('timed out')
+      || message.includes('tiempo de espera')
+    ) {
+      return 'timeout';
+    }
 
     if (status === 401 || status === 403 || rawCode.includes('auth') || message.includes('unauthorized') || message.includes('invalid api key')) {
       return 'auth';
@@ -91,6 +103,8 @@
         return 'Autenticación inválida. Revisá las credenciales del provider.';
       case 'rate_limit':
         return 'El provider alcanzó el rate limit. Probá nuevamente en unos minutos.';
+      case 'timeout':
+        return 'El provider tardó demasiado en generar el resultado. Probá nuevamente.';
       case 'network':
         return 'Falló la conexión de red con el provider.';
       case 'unavailable':
@@ -111,7 +125,7 @@
     return {
       code,
       status,
-      retryable: code === 'rate_limit' || code === 'network' || code === 'unavailable',
+      retryable: code === 'rate_limit' || code === 'timeout' || code === 'network' || code === 'unavailable',
       summary: buildSafeSummary(code, error, options)
     };
   }

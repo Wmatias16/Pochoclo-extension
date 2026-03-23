@@ -10,6 +10,7 @@
     buildSuccessPayload,
     ensureOkResponse,
     ensureText,
+    getAudioUploadMetadata,
     getFetchImpl,
     parseJsonResponse
   } = shared;
@@ -19,8 +20,9 @@
     const settings = input.settings || {};
     const apiKey = ensureText(settings.apiKey, 'Falta la API key de Groq');
     const model = settings.model || 'whisper-large-v3-turbo';
+    const upload = getAudioUploadMetadata(input.blob);
     const formData = new FormData();
-    formData.append('file', input.blob, 'audio.webm');
+    formData.append('file', input.blob, upload.fileName);
     formData.append('model', model);
     formData.append('language', input.language || 'es');
 

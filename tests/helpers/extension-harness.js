@@ -184,6 +184,7 @@ function createChromeMock(storageArea) {
 class FakeAudioContext {
   constructor() {
     this.destination = {};
+    this.sampleRate = 16000;
   }
 
   createMediaStreamSource() {
@@ -201,6 +202,18 @@ class FakeAudioContext {
       frequencyBinCount: 32,
       getByteFrequencyData(buffer) {
         buffer.fill(8);
+      }
+    };
+  }
+
+  createScriptProcessor() {
+    return {
+      onaudioprocess: null,
+      connect() {
+        return undefined;
+      },
+      disconnect() {
+        return undefined;
       }
     };
   }

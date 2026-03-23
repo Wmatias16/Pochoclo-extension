@@ -10,6 +10,7 @@
     buildSuccessPayload,
     ensureOkResponse,
     ensureText,
+    getAudioUploadMetadata,
     getFetchImpl,
     parseJsonResponse
   } = shared;
@@ -20,6 +21,7 @@
     const apiKey = ensureText(settings.apiKey, 'Falta la API key de Deepgram');
     const language = input.language || 'es';
     const model = settings.model || 'nova-3';
+    const upload = getAudioUploadMetadata(input.blob);
     const url = new URL(settings.baseUrl || 'https://api.deepgram.com/v1/listen');
     url.searchParams.set('model', model);
     url.searchParams.set('smart_format', 'true');
@@ -29,7 +31,7 @@
       method: 'POST',
       headers: {
         Authorization: `Token ${apiKey}`,
-        'Content-Type': input.blob && input.blob.type ? input.blob.type : 'audio/webm'
+        'Content-Type': upload.mimeType
       },
       body: input.blob
     });

@@ -5,10 +5,14 @@ let mediaStream = null;
 let mediaRecorder = null;
 let audioContext = null;
 let analyser = null;
+let mediaStreamSource = null;
 let audioChunks = [];
 const chunkProcessor = globalThis.PochoclaChunkProcessor;
 const offscreenBridge = globalThis.PochoclaOffscreenBridge;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
+const DEFAULT_WAV_SAMPLE_RATE = 48000;
+const PCM_AUDIO_THRESHOLD = 0.01;
+const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
 
 let captureSessionContext = {
   sessionId: null,
@@ -17,6 +21,16 @@ let captureSessionContext = {
   nextChunkIndex: 0,
   chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
 };
+
+function resetCaptureSessionContext() {
+  captureSessionContext = {
+    sessionId: null,
+    language: 'es',
+    activeProvider: null,
+    nextChunkIndex: 0,
+    chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.target !== 'offscreen') return;
@@ -69,12 +83,12 @@ async function startRecording(streamId, sessionContext) {
   });
 
   audioContext = new AudioContext();
-  const source = audioContext.createMediaStreamSource(mediaStream);
+  mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 64;
   analyser.smoothingTimeConstant = 0.8;
-  source.connect(analyser);
-  source.connect(audioContext.destination);
+  mediaStreamSource.connect(analyser);
+  mediaStreamSource.connect(audioContext.destination);
 
   mediaRecorder = new MediaRecorder(mediaStream, {
     mimeType: 'audio/webm;codecs=opus'
@@ -107,6 +121,7 @@ async function stopRecording() {
     audioContext.close();
     audioContext = null;
     analyser = null;
+    mediaStreamSource = null;
   }
 }
 
@@ -132,16 +147,18 @@ function getWaveformData() {
 }
 
 // ── Transcription capture (sends audio chunks to Whisper API) ──
-let transcriptionRecorder = null;
-let transcriptionTimer = null;
-let audioActivityMonitor = null;
+let transcriptionChunkTimerId = null;
+let transcriptionProcessorNode = null;
+let transcriptionPcmChunks = [];
+let transcriptionPcmSampleCount = 0;
+let transcriptionSampleRate = DEFAULT_WAV_SAMPLE_RATE;
 let isTranscribing = false;
 let chunkHadAudio = false;       // tracks audio activity DURING each chunk
 
 // ── Serialized transcription queue ──
 // Ensures chunks are handed to background in order, one at a time.
 let queueDrainResolve = null;
-let pendingChunkStop = 0;
+let queueDrainTimeoutId = null;
 const transcriptionProcessor = chunkProcessor.createSerialProcessor(
   async (item) => {
     const response = await offscreenBridge.dispatchChunkToBackground({
@@ -179,115 +196,202 @@ function resolveTranscriptionDrainIfReady() {
   if (
     queueDrainResolve
     && !isTranscribing
-    && pendingChunkStop === 0
     && !transcriptionProcessor.isProcessing()
     && transcriptionProcessor.size() === 0
   ) {
+    clearTimeout(queueDrainTimeoutId);
+    queueDrainTimeoutId = null;
+    resetCaptureSessionContext();
     queueDrainResolve();
     queueDrainResolve = null;
   }
 }
 
-function startTranscriptionCapture() {
-  if (!mediaStream || isTranscribing) return;
-  isTranscribing = true;
-  captureNextChunk();
+function mergePcmChunks(chunks, sampleCount) {
+  const merged = new Float32Array(sampleCount);
+  let offset = 0;
+
+  chunks.forEach((chunk) => {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  });
+
+  return merged;
 }
 
-function captureNextChunk() {
-  if (!isTranscribing || !mediaStream) return;
+function encodePcm16Wav(samples, sampleRate) {
+  const bytesPerSample = 2;
+  const blockAlign = bytesPerSample;
+  const buffer = new ArrayBuffer(44 + (samples.length * bytesPerSample));
+  const view = new DataView(buffer);
+
+  function writeAscii(offset, value) {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  }
+
+  writeAscii(0, 'RIFF');
+  view.setUint32(4, 36 + (samples.length * bytesPerSample), true);
+  writeAscii(8, 'WAVE');
+  writeAscii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, 'data');
+  view.setUint32(40, samples.length * bytesPerSample, true);
+
+  let offset = 44;
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+    offset += bytesPerSample;
+  }
+
+  const blob = new Blob([buffer], { type: 'audio/wav' });
+  blob.sampleRate = sampleRate;
+  return blob;
+}
+
+function captureInputBufferChunk(inputBuffer) {
+  if (!inputBuffer || typeof inputBuffer.numberOfChannels !== 'number' || typeof inputBuffer.getChannelData !== 'function') {
+    return;
+  }
+
+  const channelCount = Math.max(1, inputBuffer.numberOfChannels);
+  const frameLength = inputBuffer.getChannelData(0).length;
+  const monoSamples = new Float32Array(frameLength);
+  let maxAmplitude = 0;
+
+  for (let sampleIndex = 0; sampleIndex < frameLength; sampleIndex += 1) {
+    let sum = 0;
+    for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+      sum += inputBuffer.getChannelData(channelIndex)[sampleIndex] || 0;
+    }
+
+    const monoSample = sum / channelCount;
+    monoSamples[sampleIndex] = monoSample;
+    const amplitude = Math.abs(monoSample);
+    if (amplitude > maxAmplitude) {
+      maxAmplitude = amplitude;
+    }
+  }
+
+  if (maxAmplitude > PCM_AUDIO_THRESHOLD) {
+    chunkHadAudio = true;
+  }
+
+  transcriptionPcmChunks.push(monoSamples);
+  transcriptionPcmSampleCount += monoSamples.length;
+}
+
+function flushTranscriptionChunk(options = {}) {
+  const force = !!options.force;
+  const hadAudio = chunkHadAudio;
+  const hasSamples = transcriptionPcmSampleCount > 0;
 
   chunkHadAudio = false;
 
-  const recorder = new MediaRecorder(mediaStream, {
-    mimeType: 'audio/webm;codecs=opus'
-  });
-  const chunks = [];
+  if (!hasSamples) {
+    return false;
+  }
 
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
+  const samples = mergePcmChunks(transcriptionPcmChunks, transcriptionPcmSampleCount);
+  transcriptionPcmChunks = [];
+  transcriptionPcmSampleCount = 0;
+
+  if (!force && !hadAudio) {
+    return false;
+  }
+
+  if (!hadAudio) {
+    return false;
+  }
+
+  const blob = encodePcm16Wav(samples, transcriptionSampleRate || DEFAULT_WAV_SAMPLE_RATE);
+  if (blob.size > 44) {
+    enqueueTranscription(blob);
+    return true;
+  }
+
+  return false;
+}
+
+function startTranscriptionCapture() {
+  if (!mediaStream || !mediaStreamSource || !audioContext || isTranscribing) return;
+
+  isTranscribing = true;
+  chunkHadAudio = false;
+  transcriptionPcmChunks = [];
+  transcriptionPcmSampleCount = 0;
+  transcriptionSampleRate = Number.isFinite(Number(audioContext.sampleRate))
+    ? Number(audioContext.sampleRate)
+    : DEFAULT_WAV_SAMPLE_RATE;
+
+  if (typeof audioContext.createScriptProcessor !== 'function') {
+    throw new Error('El navegador no soporta captura PCM continua para transcripción');
+  }
+
+  const processorNode = audioContext.createScriptProcessor(SCRIPT_PROCESSOR_BUFFER_SIZE, 2, 1);
+  processorNode.onaudioprocess = (event) => {
+    if (!isTranscribing) {
+      return;
+    }
+
+    captureInputBufferChunk(event && event.inputBuffer);
   };
 
-  recorder.onstop = () => {
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    const hadAudio = chunkHadAudio; // Save BEFORE next chunk resets the flag
+  mediaStreamSource.connect(processorNode);
+  processorNode.connect(audioContext.destination);
+  transcriptionProcessorNode = processorNode;
 
-    // Start next chunk immediately (no audio gap)
-    if (isTranscribing && mediaStream) {
-      captureNextChunk();
-    }
-
-    // Enqueue for serialized transcription if there was audio during this chunk
-    if (blob.size > 100 && hadAudio) {
-      enqueueTranscription(blob);
-    }
-
-    if (pendingChunkStop > 0) {
-      pendingChunkStop -= 1;
-    }
-
+  transcriptionChunkTimerId = setInterval(() => {
+    flushTranscriptionChunk();
     resolveTranscriptionDrainIfReady();
-  };
-
-  transcriptionRecorder = recorder;
-  recorder.start();
-
-  // Monitor audio activity during the chunk (check every 200ms)
-  clearInterval(audioActivityMonitor);
-  audioActivityMonitor = setInterval(() => {
-    if (!analyser) return;
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(dataArray);
-    const avg = dataArray.reduce((sum, v) => sum + v, 0) / dataArray.length;
-    if (avg > 5) chunkHadAudio = true;
-  }, 200);
-
-  transcriptionTimer = setTimeout(() => {
-    clearInterval(audioActivityMonitor);
-    if (recorder.state !== 'inactive') {
-      recorder.stop();
-    }
   }, captureSessionContext.chunkIntervalMs || DEFAULT_TRANSCRIPTION_CHUNK_MS);
 }
 
 function stopTranscriptionCapture() {
   isTranscribing = false;
-  clearTimeout(transcriptionTimer);
-  clearInterval(audioActivityMonitor);
 
-  // Stop the current recorder (fires onstop → may enqueue final chunk)
-  if (transcriptionRecorder && transcriptionRecorder.state !== 'inactive') {
-    pendingChunkStop += 1;
-    transcriptionRecorder.stop();
+  clearInterval(transcriptionChunkTimerId);
+  transcriptionChunkTimerId = null;
+
+  if (transcriptionProcessorNode) {
+    if (mediaStreamSource && typeof mediaStreamSource.disconnect === 'function') {
+      mediaStreamSource.disconnect(transcriptionProcessorNode);
+    }
+    if (typeof transcriptionProcessorNode.disconnect === 'function') {
+      transcriptionProcessorNode.disconnect();
+    }
+    transcriptionProcessorNode.onaudioprocess = null;
+    transcriptionProcessorNode = null;
   }
-  transcriptionRecorder = null;
+
+  flushTranscriptionChunk({ force: true });
+  resolveTranscriptionDrainIfReady();
 
   // Return a promise that resolves when the queue finishes processing
-  if (pendingChunkStop > 0 || transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
+  if (transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
     return new Promise((resolve) => {
       queueDrainResolve = resolve;
       // Safety timeout: don't block stop forever (max 30s for pending API calls)
-      setTimeout(() => {
+      queueDrainTimeoutId = setTimeout(() => {
         if (queueDrainResolve) {
-          captureSessionContext = {
-            sessionId: null,
-            language: 'es',
-            activeProvider: null,
-            nextChunkIndex: 0,
-            chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
-          };
+          resetCaptureSessionContext();
           queueDrainResolve();
           queueDrainResolve = null;
+          queueDrainTimeoutId = null;
         }
       }, 30000);
     });
   }
-  captureSessionContext = {
-    sessionId: null,
-    language: 'es',
-    activeProvider: null,
-    nextChunkIndex: 0,
-    chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
-  };
+  clearTimeout(queueDrainTimeoutId);
+  queueDrainTimeoutId = null;
+  resetCaptureSessionContext();
   return Promise.resolve();
 }

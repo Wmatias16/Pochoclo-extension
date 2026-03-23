@@ -48,6 +48,67 @@ test('openai adapter shapes multipart request and optional translation', async (
   assert.equal(result.translated, true);
 });
 
+test('openai-compatible adapters preserve real audio extension for multipart uploads', async () => {
+  const wavBlob = new Blob(['RIFF'], { type: 'audio/wav' });
+
+  await openai.transcribe(
+    {
+      blob: wavBlob,
+      language: 'es',
+      settings: { apiKey: 'sk-openai' }
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.equal(url, 'https://api.openai.com/v1/audio/transcriptions');
+        const file = options.body.get('file');
+        assert.equal(file instanceof Blob, true);
+        assert.equal(file.type, 'audio/wav');
+        assert.equal(file.name, 'audio.wav');
+        return jsonResponse({ text: 'hola wav' });
+      }
+    }
+  );
+
+  await groq.transcribe(
+    {
+      blob: wavBlob,
+      language: 'es',
+      settings: { apiKey: 'gq-key' }
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.equal(url, 'https://api.groq.com/openai/v1/audio/transcriptions');
+        const file = options.body.get('file');
+        assert.equal(file instanceof Blob, true);
+        assert.equal(file.type, 'audio/wav');
+        assert.equal(file.name, 'audio.wav');
+        return jsonResponse({ text: 'hola wav groq' });
+      }
+    }
+  );
+
+  await whisperLocal.transcribe(
+    {
+      blob: wavBlob,
+      language: 'es',
+      settings: {
+        baseUrl: 'http://127.0.0.1:8765',
+        transcribePath: '/transcribe'
+      }
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.equal(url, 'http://127.0.0.1:8765/transcribe');
+        const file = options.body.get('file');
+        assert.equal(file instanceof Blob, true);
+        assert.equal(file.type, 'audio/wav');
+        assert.equal(file.name, 'audio.wav');
+        return jsonResponse({ text: 'hola wav local' });
+      }
+    }
+  );
+});
+
 test('openai adapter summarizes text with chat completions JSON mode', async () => {
   const result = await openai.summarizeText(
     {
@@ -164,6 +225,54 @@ test('deepgram adapter sends raw audio and extracts transcript', async () => {
   );
 
   assert.equal(result.text, 'hola deepgram');
+});
+
+test('deepgram and google adapt transport metadata for wav chunks', async () => {
+  const wavBlob = new Blob(['RIFF'], { type: 'audio/wav' });
+
+  await deepgram.transcribe(
+    {
+      blob: wavBlob,
+      language: 'es',
+      settings: { apiKey: 'dg-key' }
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.match(url, /api\.deepgram\.com\/v1\/listen/);
+        assert.equal(options.headers['Content-Type'], 'audio/wav');
+        return jsonResponse({
+          results: {
+            channels: [{ alternatives: [{ transcript: 'hola wav deepgram' }] }]
+          }
+        });
+      }
+    }
+  );
+
+  const result = await google.transcribe(
+    {
+      blob: wavBlob,
+      language: 'es',
+      settings: { apiKey: 'gg-key' },
+      context: { audioSampleRate: 16000 }
+    },
+    {
+      fetchImpl: async (url, options) => {
+        assert.match(url, /speech:recognize\?key=gg-key/);
+        const body = JSON.parse(options.body);
+        assert.equal(body.config.encoding, 'LINEAR16');
+        assert.equal(body.config.sampleRateHertz, 16000);
+        return jsonResponse({
+          results: [
+            { alternatives: [{ transcript: 'hola' }] },
+            { alternatives: [{ transcript: 'wav' }] }
+          ]
+        });
+      }
+    }
+  );
+
+  assert.equal(result.text, 'hola wav');
 });
 
 test('assemblyai adapter uploads, creates transcript, and polls until completion', async () => {

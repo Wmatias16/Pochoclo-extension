@@ -55,10 +55,12 @@ test('offscreen bridge sends blob plus session context to background', async () 
 
 test('offscreen bridge serializes chunk audio and restores it as a Blob', async () => {
   const blob = new Blob(['hola mundo'], { type: 'audio/webm' });
+  blob.sampleRate = 16000;
   const serialized = await serializeChunkBlob(blob);
   const restored = deserializeChunkBlob(serialized);
 
   assert.equal(restored instanceof Blob, true);
   assert.equal(restored.type, 'audio/webm');
   assert.equal(await restored.text(), 'hola mundo');
+  assert.equal(serialized.sampleRate, 16000);
 });

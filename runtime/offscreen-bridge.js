@@ -40,7 +40,8 @@
     return {
       mimeType: blob.type || 'audio/webm',
       size: Number.isFinite(Number(blob.size)) ? Number(blob.size) : 0,
-      base64: encodeBase64(await blob.arrayBuffer())
+      base64: encodeBase64(await blob.arrayBuffer()),
+      sampleRate: blob && Number.isFinite(Number(blob.sampleRate)) ? Number(blob.sampleRate) : undefined
     };
   }
 
@@ -59,6 +60,13 @@
       target: 'background',
       action: 'processChunk',
       audio,
+      audioMetadata: audio
+        ? {
+            mimeType: audio.mimeType || 'audio/webm',
+            size: Number.isFinite(Number(audio.size)) ? Number(audio.size) : 0,
+            sampleRate: Number.isFinite(Number(audio.sampleRate)) ? Number(audio.sampleRate) : undefined
+          }
+        : null,
       sessionId: sessionContext.sessionId || null,
       chunkIndex: Number.isFinite(Number(sessionContext.chunkIndex)) ? Number(sessionContext.chunkIndex) : 0
     };

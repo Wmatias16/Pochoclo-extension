@@ -123,6 +123,32 @@
     return btoa(binary);
   }
 
+  function getAudioUploadMetadata(blob) {
+    const mimeType = blob && typeof blob.type === 'string' && blob.type.trim()
+      ? blob.type.trim()
+      : 'audio/webm';
+
+    const extensionByMimeType = {
+      'audio/webm': 'webm',
+      'audio/webm;codecs=opus': 'webm',
+      'audio/wav': 'wav',
+      'audio/wave': 'wav',
+      'audio/x-wav': 'wav',
+      'audio/mp3': 'mp3',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+      'audio/oga': 'oga',
+      'audio/flac': 'flac',
+      'audio/mp4': 'mp4',
+      'audio/m4a': 'm4a'
+    };
+
+    return {
+      mimeType,
+      fileName: `audio.${extensionByMimeType[mimeType] || 'webm'}`
+    };
+  }
+
   function joinUrl(baseUrl, path) {
     const normalizedBase = ensureText(baseUrl, 'Falta la URL base del provider').replace(/\/+$/, '');
     const normalizedPath = hasText(path) ? path.trim() : '';
@@ -141,6 +167,7 @@
     buildSuccessPayload,
     ensureOkResponse,
     ensureText,
+    getAudioUploadMetadata,
     getFetchImpl,
     getTimeoutDeps,
     hasText,

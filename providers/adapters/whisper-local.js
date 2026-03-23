@@ -10,6 +10,7 @@
     buildSuccessPayload,
     ensureOkResponse,
     getFetchImpl,
+    getAudioUploadMetadata,
     hasText,
     joinUrl,
     parseJsonResponse
@@ -36,8 +37,9 @@
     const fetchImpl = getFetchImpl(deps);
     const settings = input.settings || {};
     const endpoint = joinUrl(settings.baseUrl, settings.transcribePath || '/transcribe');
+    const upload = getAudioUploadMetadata(input.blob);
     const formData = new FormData();
-    formData.append('file', input.blob, 'audio.webm');
+    formData.append('file', input.blob, upload.fileName);
 
     if (hasText(input.language)) {
       formData.append('language', input.language.trim());

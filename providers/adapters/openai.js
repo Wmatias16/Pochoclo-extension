@@ -11,6 +11,7 @@
     buildSuccessPayload,
     ensureOkResponse,
     ensureText,
+    getAudioUploadMetadata,
     getFetchImpl,
     getTimeoutDeps,
     parseJsonResponse
@@ -161,8 +162,9 @@
     const model = settings.model || 'whisper-1';
     const language = input.language || 'es';
     const targetLanguage = input.targetLanguage || language;
+    const upload = getAudioUploadMetadata(input.blob);
     const formData = new FormData();
-    formData.append('file', input.blob, 'audio.webm');
+    formData.append('file', input.blob, upload.fileName);
     formData.append('model', model);
     formData.append('language', language);
 

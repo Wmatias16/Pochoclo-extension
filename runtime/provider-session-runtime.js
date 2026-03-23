@@ -241,7 +241,12 @@
               sessionId: session.id,
               chunkIndex: input.message && Number.isFinite(Number(input.message.chunkIndex))
                 ? Number(input.message.chunkIndex)
-                : 0
+                : 0,
+              audioSampleRate: input.message
+                && input.message.audioMetadata
+                && Number.isFinite(Number(input.message.audioMetadata.sampleRate))
+                ? Number(input.message.audioMetadata.sampleRate)
+                : undefined
             }
           },
           {

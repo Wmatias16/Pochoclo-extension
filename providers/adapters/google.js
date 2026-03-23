@@ -25,12 +25,24 @@
     return normalized;
   }
 
+  function resolveGoogleEncoding(blob) {
+    const mimeType = blob && typeof blob.type === 'string' ? blob.type.trim() : '';
+    if (mimeType === 'audio/wav' || mimeType === 'audio/wave' || mimeType === 'audio/x-wav') {
+      return 'LINEAR16';
+    }
+    return 'WEBM_OPUS';
+  }
+
   async function transcribe(input = {}, deps = {}) {
     const fetchImpl = getFetchImpl(deps);
     const settings = input.settings || {};
     const apiKey = ensureText(settings.apiKey, 'Falta la API key de Google Speech');
     const languageCode = normalizeLanguageCode(input.language || 'es');
     const audioContent = await blobToBase64(input.blob);
+    const encoding = resolveGoogleEncoding(input.blob);
+    const sampleRateHertz = input.context && Number.isFinite(Number(input.context.audioSampleRate))
+      ? Number(input.context.audioSampleRate)
+      : undefined;
     const response = await fetchImpl(`https://speech.googleapis.com/v1/speech:recognize?key=${encodeURIComponent(apiKey)}`, {
       method: 'POST',
       headers: {
@@ -38,10 +50,11 @@
       },
       body: JSON.stringify({
         config: {
-          encoding: 'WEBM_OPUS',
+          encoding,
           languageCode,
           enableAutomaticPunctuation: true,
-          model: settings.model || 'latest_long'
+          model: settings.model || 'latest_long',
+          ...(sampleRateHertz ? { sampleRateHertz } : {})
         },
         audio: {
           content: audioContent
@@ -70,6 +83,7 @@
   return {
     id: 'google',
     normalizeLanguageCode,
+    resolveGoogleEncoding,
     transcribe
   };
 });

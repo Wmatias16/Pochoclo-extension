@@ -11,8 +11,11 @@ const chunkProcessor = globalThis.PochoclaChunkProcessor;
 const offscreenBridge = globalThis.PochoclaOffscreenBridge;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const DEFAULT_WAV_SAMPLE_RATE = 48000;
-const PCM_AUDIO_THRESHOLD = 0.01;
+// Significant-amplitude threshold for the V1 inactivity proxy shared with background defaults.
+const PCM_AUDIO_THRESHOLD = 0.05;
 const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
+// Emit at most one heartbeat every ~2.5s while meaningful audio is present.
+const AUDIO_ACTIVITY_HEARTBEAT_THROTTLE_MS = 2500;
 
 let captureSessionContext = {
   sessionId: null,
@@ -154,11 +157,50 @@ let transcriptionPcmSampleCount = 0;
 let transcriptionSampleRate = DEFAULT_WAV_SAMPLE_RATE;
 let isTranscribing = false;
 let chunkHadAudio = false;       // tracks audio activity DURING each chunk
+let lastAudioHeartbeatAt = 0;
+
+function resetAudioActivityHeartbeat() {
+  // Called on start/pause/stop so a resumed session can emit a fresh heartbeat immediately.
+  lastAudioHeartbeatAt = 0;
+}
+
+function emitAudioActivityHeartbeat(now = Date.now()) {
+  if (!isTranscribing || !captureSessionContext.sessionId) {
+    return false;
+  }
+
+  const heartbeatAt = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  if (lastAudioHeartbeatAt > 0 && (heartbeatAt - lastAudioHeartbeatAt) < AUDIO_ACTIVITY_HEARTBEAT_THROTTLE_MS) {
+    return false;
+  }
+
+  lastAudioHeartbeatAt = heartbeatAt;
+
+  try {
+    // Heartbeats are best-effort only: background uses them to push the inactivity deadline forward,
+    // but capture must continue even if the worker is restarting or messaging briefly fails.
+    const maybePromise = chrome.runtime.sendMessage({
+      target: 'background',
+      action: 'audioActivity',
+      sessionId: captureSessionContext.sessionId,
+      at: heartbeatAt
+    });
+
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.catch(() => {});
+    }
+  } catch (error) {
+    // Ignore transient messaging failures while capture continues.
+  }
+
+  return true;
+}
 
 // ── Serialized transcription queue ──
 // Ensures chunks are handed to background in order, one at a time.
 let queueDrainResolve = null;
 let queueDrainTimeoutId = null;
+let acceptedChunkCount = 0;
 const transcriptionProcessor = chunkProcessor.createSerialProcessor(
   async (item) => {
     const response = await offscreenBridge.dispatchChunkToBackground({
@@ -183,6 +225,36 @@ const transcriptionProcessor = chunkProcessor.createSerialProcessor(
   }
 );
 
+function buildTranscriptionProgressSnapshot(status = 'active') {
+  return {
+    sessionId: captureSessionContext.sessionId,
+    totalChunks: acceptedChunkCount,
+    status,
+    updatedAt: Date.now()
+  };
+}
+
+function syncTranscriptionProgress(status = 'active') {
+  if (!captureSessionContext.sessionId || !offscreenBridge || typeof offscreenBridge.dispatchTranscriptionProgressToBackground !== 'function') {
+    return Promise.resolve({ ok: false, ignored: true });
+  }
+
+  try {
+    const maybePromise = offscreenBridge.dispatchTranscriptionProgressToBackground({
+      progress: buildTranscriptionProgressSnapshot(status),
+      sendMessage: chrome.runtime.sendMessage
+    });
+
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      return maybePromise.catch(() => ({ ok: false, ignored: true }));
+    }
+
+    return Promise.resolve(maybePromise);
+  } catch (error) {
+    return Promise.resolve({ ok: false, ignored: true });
+  }
+}
+
 function enqueueTranscription(blob) {
   transcriptionProcessor.enqueue({
     blob,
@@ -190,9 +262,20 @@ function enqueueTranscription(blob) {
     chunkIndex: captureSessionContext.nextChunkIndex
   });
   captureSessionContext.nextChunkIndex += 1;
+  acceptedChunkCount += 1;
+  void syncTranscriptionProgress('active');
 }
 
 function resolveTranscriptionDrainIfReady() {
+  if (
+    captureSessionContext.sessionId
+    && acceptedChunkCount > 0
+    && !isTranscribing
+    && (transcriptionProcessor.isProcessing() || transcriptionProcessor.size() > 0)
+  ) {
+    void syncTranscriptionProgress('draining');
+  }
+
   if (
     queueDrainResolve
     && !isTranscribing
@@ -202,6 +285,7 @@ function resolveTranscriptionDrainIfReady() {
     clearTimeout(queueDrainTimeoutId);
     queueDrainTimeoutId = null;
     resetCaptureSessionContext();
+    acceptedChunkCount = 0;
     queueDrainResolve();
     queueDrainResolve = null;
   }
@@ -265,7 +349,7 @@ function captureInputBufferChunk(inputBuffer) {
   const channelCount = Math.max(1, inputBuffer.numberOfChannels);
   const frameLength = inputBuffer.getChannelData(0).length;
   const monoSamples = new Float32Array(frameLength);
-  let maxAmplitude = 0;
+  let sumSquares = 0;
 
   for (let sampleIndex = 0; sampleIndex < frameLength; sampleIndex += 1) {
     let sum = 0;
@@ -275,14 +359,16 @@ function captureInputBufferChunk(inputBuffer) {
 
     const monoSample = sum / channelCount;
     monoSamples[sampleIndex] = monoSample;
-    const amplitude = Math.abs(monoSample);
-    if (amplitude > maxAmplitude) {
-      maxAmplitude = amplitude;
-    }
+    sumSquares += monoSample * monoSample;
   }
 
-  if (maxAmplitude > PCM_AUDIO_THRESHOLD) {
+  const rms = frameLength > 0
+    ? Math.sqrt(sumSquares / frameLength)
+    : 0;
+
+  if (rms > PCM_AUDIO_THRESHOLD) {
     chunkHadAudio = true;
+    emitAudioActivityHeartbeat();
   }
 
   transcriptionPcmChunks.push(monoSamples);
@@ -326,6 +412,7 @@ function startTranscriptionCapture() {
 
   isTranscribing = true;
   chunkHadAudio = false;
+  resetAudioActivityHeartbeat();
   transcriptionPcmChunks = [];
   transcriptionPcmSampleCount = 0;
   transcriptionSampleRate = Number.isFinite(Number(audioContext.sampleRate))
@@ -357,6 +444,8 @@ function startTranscriptionCapture() {
 
 function stopTranscriptionCapture() {
   isTranscribing = false;
+  // Stop/pause must silence future heartbeats before queue draining and media teardown begin.
+  resetAudioActivityHeartbeat();
 
   clearInterval(transcriptionChunkTimerId);
   transcriptionChunkTimerId = null;
@@ -377,12 +466,14 @@ function stopTranscriptionCapture() {
 
   // Return a promise that resolves when the queue finishes processing
   if (transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
+    void syncTranscriptionProgress('draining');
     return new Promise((resolve) => {
       queueDrainResolve = resolve;
       // Safety timeout: don't block stop forever (max 30s for pending API calls)
       queueDrainTimeoutId = setTimeout(() => {
         if (queueDrainResolve) {
           resetCaptureSessionContext();
+          acceptedChunkCount = 0;
           queueDrainResolve();
           queueDrainResolve = null;
           queueDrainTimeoutId = null;
@@ -393,5 +484,6 @@ function stopTranscriptionCapture() {
   clearTimeout(queueDrainTimeoutId);
   queueDrainTimeoutId = null;
   resetCaptureSessionContext();
+  acceptedChunkCount = 0;
   return Promise.resolve();
 }

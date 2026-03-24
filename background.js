@@ -5,6 +5,7 @@ if (typeof importScripts === 'function') {
   importScripts(
     'diagnostics/provider-logger.js',
     'runtime/provider-session-runtime.js',
+    'runtime/recording-awareness.js',
     'runtime/offscreen-bridge.js',
     'providers/errors.js',
     'providers/registry.js',
@@ -28,6 +29,10 @@ const offscreenBridge = globalThis.PochoclaOffscreenBridge;
 const providerSettingsStore = globalThis.PochoclaProviderSettings;
 const transcriptionStore = globalThis.PochoclaTranscriptionStorage;
 const providerSessionRuntime = globalThis.PochoclaProviderSessionRuntime;
+const recordingAwarenessRuntime = globalThis.PochoclaRecordingAwareness
+  || (typeof module === 'object' && module.exports
+    ? require('./runtime/recording-awareness.js')
+    : {});
 const transcriptionSummarizer = globalThis.PochoclaTranscriptionSummarizer;
 const providerAdapters = {
   openai: globalThis.PochoclaOpenAIAdapter,
@@ -58,10 +63,151 @@ let processChunkChain = Promise.resolve();
 const activeSummaryJobs = new Map();
 
 const SUMMARY_JOB_STORAGE_KEY = 'summaryJobs';
+const TRANSCRIPTION_PROGRESS_STORAGE_KEY = 'transcriptionProgress';
 const SUMMARY_JOB_TTL_MS = 2 * 60 * 1000;
 
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const OPENAI_LIVE_TRANSCRIPTION_CHUNK_MS = 3000;
+
+const PRODUCT_NAME = 'Pochoclo - Transcriptor';
+/**
+ * Recording-awareness defaults used when persisted state is missing fields.
+ * - reminderIntervalMin: native reminder cadence (2 min by default)
+ * - inactivityMs: auto-stop window without significant audio (60s by default)
+ * - amplitudeThreshold: V1 amplitude proxy persisted for parity with runtime helpers
+ * - indicatorVisible / activeNotificationId: transient UI cleanup flags reset on pause/stop/reset
+ */
+const RECORDING_AWARENESS_DEFAULTS = recordingAwarenessRuntime.DEFAULT_RECORDING_AWARENESS || Object.freeze({
+  sessionId: null,
+  reminderIntervalMin: 2,
+  inactivityMs: 60 * 1000,
+  amplitudeThreshold: 0.05,
+  lastAudioAt: 0,
+  indicatorVisible: false,
+  activeNotificationId: null
+});
+const IDLE_ACTION_ICON_PATH = recordingAwarenessRuntime.IDLE_ACTION_ICON_PATH || 'icons/logo.png';
+const TRANSPARENT_BADGE_BACKGROUND_COLOR = recordingAwarenessRuntime.TRANSPARENT_BADGE_BACKGROUND_COLOR || Object.freeze([0, 0, 0, 0]);
+// Reminder notifications expose a single primary action: stop the active capture session.
+const REMINDER_NOTIFICATION_BUTTON_INDEX = 0;
+
+function isRecordingAwarenessAlarm(name) {
+  return typeof name === 'string'
+    && (name.startsWith('recording-reminder:') || name.startsWith('recording-inactive:'));
+}
+
+function isRecordingAwarenessNotification(id) {
+  return typeof id === 'string'
+    && (id.startsWith('recording-reminder:') || id.startsWith('recording-autostop:'));
+}
+
+function buildReminderNotificationId(sessionId) {
+  return `recording-reminder:${sessionId || 'unknown'}`;
+}
+
+function buildAutoStopNotificationId(sessionId) {
+  return `recording-autostop:${sessionId || 'unknown'}`;
+}
+
+function buildRecordingAwarenessDefaults(overrides = {}) {
+  if (typeof recordingAwarenessRuntime.buildRecordingAwarenessDefaults === 'function') {
+    return recordingAwarenessRuntime.buildRecordingAwarenessDefaults(overrides);
+  }
+
+  return {
+    ...RECORDING_AWARENESS_DEFAULTS,
+    ...(overrides && typeof overrides === 'object' ? overrides : {})
+  };
+}
+
+function normalizeRecordingState(state = {}) {
+  if (typeof recordingAwarenessRuntime.normalizeRecordingState === 'function') {
+    return recordingAwarenessRuntime.normalizeRecordingState(state);
+  }
+
+  return {
+    status: typeof state.status === 'string' ? state.status : 'idle',
+    startTime: Number.isFinite(Number(state.startTime)) ? Number(state.startTime) : 0,
+    pausedAt: Number.isFinite(Number(state.pausedAt)) ? Number(state.pausedAt) : 0,
+    pausedDuration: Number.isFinite(Number(state.pausedDuration)) ? Number(state.pausedDuration) : 0,
+    tabId: Number.isInteger(state.tabId) ? state.tabId : null,
+    tabTitle: typeof state.tabTitle === 'string' ? state.tabTitle : '',
+    tabUrl: typeof state.tabUrl === 'string' ? state.tabUrl : '',
+    awareness: buildRecordingAwarenessDefaults(state.awareness)
+  };
+}
+
+function buildRecordingReminderAlarmName(sessionId) {
+  if (typeof recordingAwarenessRuntime.buildRecordingReminderAlarmName === 'function') {
+    return recordingAwarenessRuntime.buildRecordingReminderAlarmName(sessionId);
+  }
+
+  return `recording-reminder:${sessionId || 'unknown'}`;
+}
+
+function buildRecordingInactivityAlarmName(sessionId) {
+  if (typeof recordingAwarenessRuntime.buildRecordingInactivityAlarmName === 'function') {
+    return recordingAwarenessRuntime.buildRecordingInactivityAlarmName(sessionId);
+  }
+
+  return `recording-inactive:${sessionId || 'unknown'}`;
+}
+
+function parseRecordingAwarenessAlarmName(name) {
+  if (typeof recordingAwarenessRuntime.parseAlarmKey === 'function') {
+    return recordingAwarenessRuntime.parseAlarmKey(name);
+  }
+
+  if (typeof name !== 'string' || name.length === 0) {
+    return null;
+  }
+
+  const separatorIndex = name.indexOf(':');
+  if (separatorIndex === -1) {
+    return null;
+  }
+
+  const rawType = name.slice(0, separatorIndex);
+  const sessionId = name.slice(separatorIndex + 1) || null;
+  return {
+    rawType,
+    type: rawType === 'recording-reminder'
+      ? 'reminder'
+      : (rawType === 'recording-inactive' ? 'inactive' : rawType),
+    sessionId
+  };
+}
+
+function buildRecordingToolbarPresentation(state) {
+  if (typeof recordingAwarenessRuntime.buildToolbarPresentation === 'function') {
+    return recordingAwarenessRuntime.buildToolbarPresentation(state, {
+      productName: PRODUCT_NAME,
+    });
+  }
+
+  return {
+    badgeText: state && state.status === 'recording' ? 'REC' : '',
+    badgeBackgroundColor: state && state.status === 'recording' ? '#dc2626' : TRANSPARENT_BADGE_BACKGROUND_COLOR,
+    title: state && state.status === 'recording' ? `${PRODUCT_NAME} • Grabando` : PRODUCT_NAME,
+    isRecording: !!(state && state.status === 'recording')
+  };
+}
+
+function calculateRecordingInactivityDeadline(state, now = Date.now()) {
+  if (typeof recordingAwarenessRuntime.calculateInactivityDeadline === 'function') {
+    return recordingAwarenessRuntime.calculateInactivityDeadline(state, now);
+  }
+
+  const normalizedState = normalizeRecordingState(state);
+  if (normalizedState.status !== 'recording') {
+    return null;
+  }
+
+  const baseTimestamp = normalizedState.awareness.lastAudioAt > 0
+    ? normalizedState.awareness.lastAudioAt
+    : normalizedState.startTime;
+  return baseTimestamp + normalizedState.awareness.inactivityMs;
+}
 
 const HALLUCINATIONS = [
   'subtítulos realizados por la comunidad de amara.org',
@@ -598,6 +744,99 @@ async function clearTranscriptSession() {
   await chrome.storage.local.remove('transcriptSession');
 }
 
+function normalizeTranscriptionProgress(progress = {}) {
+  return {
+    sessionId: typeof progress.sessionId === 'string' && progress.sessionId.trim().length > 0
+      ? progress.sessionId.trim()
+      : null,
+    totalChunks: Math.max(0, Number.isFinite(Number(progress.totalChunks)) ? Number(progress.totalChunks) : 0),
+    completedChunks: Math.max(0, Number.isFinite(Number(progress.completedChunks)) ? Number(progress.completedChunks) : 0),
+    status: typeof progress.status === 'string' ? progress.status : 'idle',
+    updatedAt: Number.isFinite(Number(progress.updatedAt)) ? Number(progress.updatedAt) : Date.now()
+  };
+}
+
+async function getTranscriptionProgress() {
+  const stored = await chrome.storage.local.get(TRANSCRIPTION_PROGRESS_STORAGE_KEY);
+  const progress = stored ? stored[TRANSCRIPTION_PROGRESS_STORAGE_KEY] : null;
+  return progress ? normalizeTranscriptionProgress(progress) : null;
+}
+
+async function setTranscriptionProgress(progress) {
+  const next = normalizeTranscriptionProgress(progress);
+  await chrome.storage.local.set({ [TRANSCRIPTION_PROGRESS_STORAGE_KEY]: next });
+  return next;
+}
+
+async function patchTranscriptionProgress(patchOrUpdater) {
+  const current = await getTranscriptionProgress();
+  const patch = typeof patchOrUpdater === 'function'
+    ? await patchOrUpdater(current)
+    : patchOrUpdater;
+
+  if (!patch) {
+    return current;
+  }
+
+  return setTranscriptionProgress({
+    ...(current || {}),
+    ...patch,
+    updatedAt: Number.isFinite(Number(patch.updatedAt)) ? Number(patch.updatedAt) : Date.now()
+  });
+}
+
+async function clearTranscriptionProgress() {
+  await chrome.storage.local.remove(TRANSCRIPTION_PROGRESS_STORAGE_KEY);
+}
+
+async function maybeFinalizeTranscriptionProgress(progressInput) {
+  const progress = progressInput ? normalizeTranscriptionProgress(progressInput) : await getTranscriptionProgress();
+  if (!progress || !progress.sessionId) {
+    return null;
+  }
+
+  const state = await getState();
+  const isRecordingActive = state.status === 'recording' || state.status === 'paused';
+  const isDrained = progress.completedChunks >= progress.totalChunks;
+
+  if (!isRecordingActive && isDrained) {
+    await clearTranscriptionProgress();
+    return null;
+  }
+
+  return progress;
+}
+
+async function syncTranscriptionProgress(snapshot = {}) {
+  const incoming = normalizeTranscriptionProgress(snapshot);
+  const transcriptSession = await getTranscriptSession();
+  const current = await getTranscriptionProgress();
+  const activeSessionId = transcriptSession && transcriptSession.id ? transcriptSession.id : null;
+
+  if (!incoming.sessionId) {
+    return { ok: false, error: 'Falta sessionId para sincronizar el progreso.' };
+  }
+
+  if (activeSessionId && incoming.sessionId !== activeSessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  if (!activeSessionId && current && current.sessionId && incoming.sessionId !== current.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-progress' };
+  }
+
+  const merged = await setTranscriptionProgress({
+    sessionId: incoming.sessionId,
+    totalChunks: Math.max(current && current.sessionId === incoming.sessionId ? current.totalChunks : 0, incoming.totalChunks),
+    completedChunks: current && current.sessionId === incoming.sessionId ? current.completedChunks : 0,
+    status: incoming.status,
+    updatedAt: incoming.updatedAt
+  });
+
+  const finalized = await maybeFinalizeTranscriptionProgress(merged);
+  return { ok: true, progress: finalized };
+}
+
 async function readProviderSettings() {
   if (providerSettingsStore && typeof providerSettingsStore.readProviderSettings === 'function') {
     return providerSettingsStore.readProviderSettings(chrome.storage.local, {
@@ -636,14 +875,424 @@ function getProviderLabel(providerId) {
 
 async function getState() {
   const { recState } = await chrome.storage.local.get('recState');
-  return recState || { status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0 };
+  return normalizeRecordingState(recState || {
+    status: 'idle',
+    startTime: 0,
+    pausedAt: 0,
+    pausedDuration: 0,
+    tabId: null,
+    tabTitle: '',
+    tabUrl: '',
+    awareness: buildRecordingAwarenessDefaults()
+  });
 }
 
 async function setState(patch) {
   const current = await getState();
-  const next = { ...current, ...patch };
+  const next = normalizeRecordingState({
+    ...current,
+    ...patch,
+    awareness: buildRecordingAwarenessDefaults({
+      ...(current && current.awareness ? current.awareness : {}),
+      ...(patch && patch.awareness ? patch.awareness : {})
+    })
+  });
   await chrome.storage.local.set({ recState: next });
   return next;
+}
+
+function formatElapsedRecordingTime(state, now = Date.now()) {
+  const normalizedState = normalizeRecordingState(state);
+  if (normalizedState.startTime <= 0) {
+    return '00:00';
+  }
+
+  const referenceNow = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const pausedPenalty = normalizedState.status === 'paused' && normalizedState.pausedAt > 0
+    ? Math.max(0, referenceNow - normalizedState.pausedAt)
+    : 0;
+  const elapsedMs = Math.max(
+    0,
+    referenceNow - normalizedState.startTime - normalizedState.pausedDuration - pausedPenalty
+  );
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function buildAwarenessSnapshot(state, now = Date.now(), viewerTabId = null) {
+  const normalizedState = normalizeRecordingState(state);
+  const isActiveIndicatorTab = Number.isInteger(normalizedState.tabId)
+    && normalizedState.tabId !== null
+    && (!Number.isInteger(viewerTabId) || viewerTabId === normalizedState.tabId);
+
+  return {
+    status: normalizedState.status,
+    startTime: normalizedState.startTime,
+    pausedAt: normalizedState.pausedAt,
+    pausedDuration: normalizedState.pausedDuration,
+    tabId: normalizedState.tabId,
+    tabTitle: normalizedState.tabTitle,
+    tabUrl: normalizedState.tabUrl,
+    sessionId: normalizedState.awareness.sessionId,
+    indicatorVisible: normalizedState.status === 'recording' && isActiveIndicatorTab,
+    elapsedMs: Math.max(0, Number(now) - normalizedState.startTime - normalizedState.pausedDuration),
+    elapsedText: formatElapsedRecordingTime(normalizedState, now),
+    reminderIntervalMin: normalizedState.awareness.reminderIntervalMin,
+    inactivityMs: normalizedState.awareness.inactivityMs,
+    lastAudioAt: normalizedState.awareness.lastAudioAt,
+    activeNotificationId: normalizedState.awareness.activeNotificationId
+  };
+}
+
+function buildRecordingIndicatorStateResponse(state, sender = {}, now = Date.now()) {
+  const senderTabId = sender && sender.tab && Number.isInteger(sender.tab.id)
+    ? sender.tab.id
+    : null;
+
+  return {
+    ok: true,
+    state: buildAwarenessSnapshot(state, now, senderTabId)
+  };
+}
+
+async function broadcastRecordingState(state) {
+  const normalizedState = normalizeRecordingState(state);
+  const message = {
+    type: 'recording-state-changed',
+    state: buildAwarenessSnapshot(normalizedState)
+  };
+
+  if (Number.isInteger(normalizedState.tabId) && normalizedState.tabId >= 0 && chrome.tabs && typeof chrome.tabs.sendMessage === 'function') {
+    try {
+      await chrome.tabs.sendMessage(normalizedState.tabId, message);
+    } catch (error) {
+      // Ignore tabs that are gone or not ready for messaging.
+    }
+  }
+}
+
+async function clearNotification(notificationId) {
+  if (!notificationId || !chrome.notifications || typeof chrome.notifications.clear !== 'function') {
+    return false;
+  }
+
+  return chrome.notifications.clear(notificationId);
+}
+
+async function clearAwarenessNotifications(state) {
+  const normalizedState = normalizeRecordingState(state);
+  const ids = new Set();
+
+  if (normalizedState.awareness.activeNotificationId) {
+    ids.add(normalizedState.awareness.activeNotificationId);
+  }
+
+  if (normalizedState.awareness.sessionId) {
+    ids.add(buildReminderNotificationId(normalizedState.awareness.sessionId));
+    ids.add(buildAutoStopNotificationId(normalizedState.awareness.sessionId));
+  }
+
+  await Promise.all(Array.from(ids).map((id) => clearNotification(id)));
+}
+
+async function clearRecordingAwarenessArtifacts(state, options = {}) {
+  const normalizedState = normalizeRecordingState(state);
+  const sessionId = normalizedState.awareness.sessionId;
+  const targetStatus = typeof options.targetStatus === 'string' ? options.targetStatus : 'idle';
+  const clearSession = options.clearSession !== false;
+
+  // Unified cleanup path for stop/reset/error and paused-state reconciliation:
+  // - always clear reminder + inactivity alarms
+  // - always clear outstanding reminder/autostop notifications
+  // - always broadcast indicatorVisible:false so the recording tab removes stale UI
+  // - optionally keep sessionId when pausing so resume can restore the same awareness session
+
+  if (sessionId && chrome.alarms && typeof chrome.alarms.clear === 'function') {
+    await chrome.alarms.clear(buildRecordingReminderAlarmName(sessionId));
+    await chrome.alarms.clear(buildRecordingInactivityAlarmName(sessionId));
+  }
+
+  await clearAwarenessNotifications(normalizedState);
+  await broadcastRecordingState({
+    ...normalizedState,
+    status: targetStatus,
+    tabId: normalizedState.tabId,
+    awareness: buildRecordingAwarenessDefaults({
+      ...normalizedState.awareness,
+      sessionId: clearSession ? null : normalizedState.awareness.sessionId,
+      indicatorVisible: false,
+      activeNotificationId: null
+    })
+  });
+}
+
+async function createReminderNotification(state, now = Date.now()) {
+  const normalizedState = normalizeRecordingState(state);
+  const sessionId = normalizedState.awareness.sessionId;
+
+  if (!sessionId || !chrome.notifications || typeof chrome.notifications.create !== 'function') {
+    return null;
+  }
+
+  const notificationId = buildReminderNotificationId(sessionId);
+  const elapsedText = formatElapsedRecordingTime(normalizedState, now);
+  await chrome.notifications.create(notificationId, {
+    type: 'basic',
+    iconUrl: IDLE_ACTION_ICON_PATH,
+    title: 'Grabación activa',
+    message: `Seguís grabando hace ${elapsedText}.`,
+    buttons: [{ title: 'Detener' }],
+    requireInteraction: false,
+    priority: 1
+  });
+  return notificationId;
+}
+
+async function createAutoStopNotification(state, now = Date.now()) {
+  const normalizedState = normalizeRecordingState(state);
+  const sessionId = normalizedState.awareness.sessionId;
+
+  if (!sessionId || !chrome.notifications || typeof chrome.notifications.create !== 'function') {
+    return null;
+  }
+
+  const notificationId = buildAutoStopNotificationId(sessionId);
+  const elapsedText = formatElapsedRecordingTime(normalizedState, now);
+  await chrome.notifications.create(notificationId, {
+    type: 'basic',
+    iconUrl: IDLE_ACTION_ICON_PATH,
+    title: 'Grabación detenida por inactividad',
+    message: `La grabación se detuvo automáticamente tras ${elapsedText} sin actividad significativa.`,
+    priority: 2
+  });
+  return notificationId;
+}
+
+async function reconcileRecordingAwareness(stateInput, options = {}) {
+  const state = normalizeRecordingState(stateInput);
+  const presentation = buildRecordingToolbarPresentation(state);
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+
+  if (chrome.action && typeof chrome.action.setBadgeText === 'function') {
+    await chrome.action.setBadgeText({ text: presentation.badgeText });
+  }
+
+  if (chrome.action && typeof chrome.action.setTitle === 'function') {
+    await chrome.action.setTitle({ title: presentation.title });
+  }
+
+  if (chrome.action && typeof chrome.action.setBadgeBackgroundColor === 'function') {
+    await chrome.action.setBadgeBackgroundColor({
+      color: presentation.badgeBackgroundColor || TRANSPARENT_BADGE_BACKGROUND_COLOR
+    });
+  }
+
+  if (!state.awareness.sessionId) {
+    // No active awareness session means everything must be cleaned up and kept idle.
+    await clearRecordingAwarenessArtifacts(state, {
+      targetStatus: state.status,
+      clearSession: true
+    });
+    return normalizeRecordingState({
+      ...state,
+      awareness: buildRecordingAwarenessDefaults({
+        ...state.awareness,
+        sessionId: null,
+        indicatorVisible: false,
+        activeNotificationId: null
+      })
+    });
+  }
+
+  if (!presentation.isRecording) {
+    // Paused/non-recording states keep persisted session context but must clear UI side effects.
+    await clearRecordingAwarenessArtifacts(state, {
+      targetStatus: state.status,
+      clearSession: false
+    });
+    return normalizeRecordingState({
+      ...state,
+      awareness: buildRecordingAwarenessDefaults({
+        ...state.awareness,
+        indicatorVisible: false,
+        activeNotificationId: null
+      })
+    });
+  }
+
+  const reminderAlarmName = buildRecordingReminderAlarmName(state.awareness.sessionId);
+  const inactivityAlarmName = buildRecordingInactivityAlarmName(state.awareness.sessionId);
+  const reminderDelayMinutes = Math.max(1, Number(state.awareness.reminderIntervalMin) || RECORDING_AWARENESS_DEFAULTS.reminderIntervalMin);
+
+  if (chrome.alarms && typeof chrome.alarms.create === 'function') {
+    await chrome.alarms.create(reminderAlarmName, {
+      delayInMinutes: reminderDelayMinutes,
+      periodInMinutes: reminderDelayMinutes
+    });
+
+    const inactivityDeadline = calculateRecordingInactivityDeadline(state, now);
+    if (Number.isFinite(inactivityDeadline)) {
+      await chrome.alarms.create(inactivityAlarmName, {
+        when: Math.max(now, inactivityDeadline)
+      });
+    }
+  }
+
+  await broadcastRecordingState({
+    ...state,
+    awareness: buildRecordingAwarenessDefaults({
+      ...state.awareness,
+      indicatorVisible: true,
+      activeNotificationId: options.notificationId || state.awareness.activeNotificationId || null
+    })
+  });
+
+  return normalizeRecordingState({
+    ...state,
+    awareness: buildRecordingAwarenessDefaults({
+      ...state.awareness,
+      indicatorVisible: true,
+      activeNotificationId: options.notificationId || state.awareness.activeNotificationId || null
+    })
+  });
+}
+
+async function persistAndReconcileState(patch, options = {}) {
+  const nextState = await setState(patch);
+  const reconciledState = await reconcileRecordingAwareness(nextState, options);
+
+  if (JSON.stringify(reconciledState.awareness) !== JSON.stringify(nextState.awareness)) {
+    return setState({ awareness: reconciledState.awareness });
+  }
+
+  return nextState;
+}
+
+async function stopRecordingAndCleanup(reason = 'user-stop', options = {}) {
+  const prevState = await getState();
+  const transcriptSession = await getTranscriptSession();
+  let finalizedSession = transcriptSession;
+  const idleAwareness = buildRecordingAwarenessDefaults();
+
+  // Stop is terminal cleanup: alarms, notifications, badge/icon, and page indicator all return to idle.
+  await clearRecordingAwarenessArtifacts(prevState, {
+    targetStatus: 'idle',
+    clearSession: true
+  });
+  const idleState = await setState({
+    status: 'idle',
+    startTime: 0,
+    pausedAt: 0,
+    pausedDuration: 0,
+    tabId: null,
+    tabTitle: '',
+    tabUrl: '',
+    awareness: idleAwareness
+  });
+  await reconcileRecordingAwareness(idleState, { now: options.now });
+
+  try {
+    await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
+  } catch (e) {
+    // Offscreen may already be gone — that's fine
+  }
+
+  await maybeFinalizeTranscriptionProgress();
+
+  if (transcriptSession && providerSessionRuntime && typeof providerSessionRuntime.finalizeSession === 'function') {
+    finalizedSession = providerSessionRuntime.finalizeSession(transcriptSession, {
+      status: transcriptSession.status === 'failed' || reason === 'error' ? 'failed' : 'completed',
+      endedAt: Date.now(),
+      stopReason: reason
+    });
+    await setTranscriptSession(finalizedSession);
+  }
+
+  if (prevState.status !== 'idle') {
+    await autoSaveTranscript(prevState, finalizedSession);
+  }
+
+  if (reason === 'inactive') {
+    await createAutoStopNotification(prevState, options.now);
+  }
+
+  setTimeout(() => closeOffscreen().catch(() => {}), 2000);
+  return { ok: true, reason };
+}
+
+async function syncRecordingAwarenessOnStartup() {
+  const state = await getState();
+  const nextState = await reconcileRecordingAwareness(state, { startup: true });
+
+  if (JSON.stringify(nextState.awareness) !== JSON.stringify(state.awareness)) {
+    await setState({ awareness: nextState.awareness });
+  }
+}
+
+async function handleReminderAlarm(parsedAlarm, state, now = Date.now()) {
+  const initialState = normalizeRecordingState(state);
+  if (initialState.status !== 'recording' || initialState.awareness.sessionId !== parsedAlarm.sessionId) {
+    if (chrome.alarms && typeof chrome.alarms.clear === 'function') {
+      await chrome.alarms.clear(buildRecordingReminderAlarmName(parsedAlarm.sessionId));
+    }
+    return { ignored: true, reason: 'stale-session' };
+  }
+
+  const freshState = normalizeRecordingState(await getState());
+  if (freshState.status !== 'recording' || freshState.awareness.sessionId !== parsedAlarm.sessionId) {
+    if (chrome.alarms && typeof chrome.alarms.clear === 'function') {
+      await chrome.alarms.clear(buildRecordingReminderAlarmName(parsedAlarm.sessionId));
+    }
+    return { ignored: true, reason: 'stale-after-refresh' };
+  }
+
+  const notificationId = await createReminderNotification(freshState, now);
+  const nextState = await persistAndReconcileState({
+    awareness: {
+      ...freshState.awareness,
+      activeNotificationId: notificationId
+    }
+  }, {
+    now,
+    notificationId
+  });
+
+  return { ignored: false, state: nextState };
+}
+
+async function handleInactivityAlarm(parsedAlarm, state, now = Date.now()) {
+  const initialState = normalizeRecordingState(state);
+  if (initialState.status !== 'recording' || initialState.awareness.sessionId !== parsedAlarm.sessionId) {
+    if (chrome.alarms && typeof chrome.alarms.clear === 'function') {
+      await chrome.alarms.clear(buildRecordingInactivityAlarmName(parsedAlarm.sessionId));
+    }
+    return { ignored: true, reason: 'stale-session' };
+  }
+
+  const freshState = normalizeRecordingState(await getState());
+  if (freshState.status !== 'recording' || freshState.awareness.sessionId !== parsedAlarm.sessionId) {
+    if (chrome.alarms && typeof chrome.alarms.clear === 'function') {
+      await chrome.alarms.clear(buildRecordingInactivityAlarmName(parsedAlarm.sessionId));
+    }
+    return { ignored: true, reason: 'stale-after-refresh' };
+  }
+
+  const deadline = calculateRecordingInactivityDeadline(freshState, now);
+  if (Number.isFinite(deadline) && deadline > now) {
+    await reconcileRecordingAwareness(freshState, { now });
+    return { ignored: true, reason: 'not-due-yet' };
+  }
+
+  await stopRecordingAndCleanup('inactive', { now });
+  return { ignored: false, stopped: true };
 }
 
 // ── Offscreen document management ──
@@ -679,7 +1328,10 @@ async function closeOffscreen() {
 
 // ── Message handler ──
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.target !== 'background') return;
+  const acceptsUntargetedContentMessage = !msg.target
+    && (msg.action === 'stopCapture' || msg.action === 'getRecordingIndicatorState');
+
+  if (msg.target !== 'background' && !acceptsUntargetedContentMessage) return;
 
   switch (msg.action) {
     case 'startCapture':
@@ -688,6 +1340,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'stopCapture':
       handleStop().then(r => sendResponse(r)).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'getRecordingIndicatorState':
+      getState()
+        .then((state) => sendResponse(buildRecordingIndicatorStateResponse(state, sender)))
+        .catch((error) => sendResponse({ ok: false, error: error.message }));
       return true;
 
     case 'pauseCapture':
@@ -700,6 +1358,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'resetCapture':
       handleReset().then(r => sendResponse(r)).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'audioActivity':
+      handleAudioActivity(msg).then(r => sendResponse(r)).catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
 
     case 'getState':
@@ -748,6 +1410,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
       return true;
 
+    case 'syncTranscriptionProgress':
+      syncTranscriptionProgress(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
     case 'getTranscriptions':
       getTranscriptions().then(list => sendResponse(list));
       return true;
@@ -767,6 +1433,59 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
   }
 });
+
+if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addListener === 'function') {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (!alarm || !isRecordingAwarenessAlarm(alarm.name)) {
+      return;
+    }
+
+    const parsedAlarm = parseRecordingAwarenessAlarmName(alarm.name);
+
+    Promise.resolve()
+      .then(() => getState())
+      .then((state) => {
+        if (!parsedAlarm) {
+          return null;
+        }
+
+        if (parsedAlarm.type === 'reminder') {
+          return handleReminderAlarm(parsedAlarm, state, alarm.scheduledTime || Date.now());
+        }
+
+        if (parsedAlarm.type === 'inactive') {
+          return handleInactivityAlarm(parsedAlarm, state, alarm.scheduledTime || Date.now());
+        }
+
+        return null;
+      })
+      .catch(() => {});
+  });
+}
+
+if (chrome.notifications && chrome.notifications.onButtonClicked && typeof chrome.notifications.onButtonClicked.addListener === 'function') {
+  chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+    if (!isRecordingAwarenessNotification(notificationId) || buttonIndex !== REMINDER_NOTIFICATION_BUTTON_INDEX) {
+      return;
+    }
+
+    Promise.resolve()
+      .then(() => handleStop())
+      .catch(() => {});
+  });
+}
+
+if (chrome.runtime && chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
+  chrome.runtime.onStartup.addListener(() => {
+    syncRecordingAwarenessOnStartup().catch(() => {});
+  });
+}
+
+if (chrome.runtime && chrome.runtime.onInstalled && typeof chrome.runtime.onInstalled.addListener === 'function') {
+  chrome.runtime.onInstalled.addListener(() => {
+    syncRecordingAwarenessOnStartup().catch(() => {});
+  });
+}
 
 // ── Handlers ──
 async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
@@ -819,6 +1538,14 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
 
   if (!resp.ok) throw new Error(resp.error);
 
+  await setTranscriptionProgress({
+    sessionId: transcriptionSession.id,
+    totalChunks: 0,
+    completedChunks: 0,
+    status: 'active',
+    updatedAt: Date.now()
+  });
+
   // Clear previous transcript for fresh start
   await chrome.storage.local.remove('transcript');
 
@@ -827,14 +1554,21 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
     startedAt: Date.now()
   });
 
-  await setState({
+  const awarenessStartedAt = Date.now();
+  await persistAndReconcileState({
     status: 'recording',
-    startTime: Date.now(),
+    startTime: awarenessStartedAt,
     pausedAt: 0,
     pausedDuration: 0,
     tabId,
     tabTitle: tabTitle || '',
-    tabUrl: tabUrl || ''
+    tabUrl: tabUrl || '',
+    awareness: buildRecordingAwarenessDefaults({
+      sessionId: transcriptionSession.id,
+      lastAudioAt: awarenessStartedAt,
+      indicatorVisible: true,
+      activeNotificationId: null
+    })
   });
 
   if (typeof startLogger.info === 'function') {
@@ -858,35 +1592,22 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
 }
 
 async function handleStop() {
-  const prevState = await getState();
-  const transcriptSession = await getTranscriptSession();
-  let finalizedSession = transcriptSession;
-  // Set state to idle first for responsive UI
-  await setState({ status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0, tabId: null, tabTitle: '', tabUrl: '' });
-  try {
-    // stop is now async — waits for final chunk + queue to drain
-    await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
-  } catch (e) {
-    // Offscreen may already be gone — that's fine
-  }
-  if (transcriptSession && providerSessionRuntime && typeof providerSessionRuntime.finalizeSession === 'function') {
-    finalizedSession = providerSessionRuntime.finalizeSession(transcriptSession, {
-      status: transcriptSession.status === 'failed' ? 'failed' : 'completed',
-      endedAt: Date.now()
-    });
-    await setTranscriptSession(finalizedSession);
-  }
-  // Auto-save complete transcript to history
-  if (prevState.status !== 'idle') {
-    await autoSaveTranscript(prevState, finalizedSession);
-  }
-  setTimeout(() => closeOffscreen().catch(() => {}), 2000);
-  return { ok: true };
+  return stopRecordingAndCleanup('user-stop');
 }
 
 async function handlePause() {
   await chrome.runtime.sendMessage({ target: 'offscreen', action: 'pause' });
-  await setState({ status: 'paused', pausedAt: Date.now() });
+  const state = await getState();
+  // Pause keeps session identity for resume, but reminders/inactivity timers and page UI must disappear.
+  await persistAndReconcileState({
+    status: 'paused',
+    pausedAt: Date.now(),
+    awareness: {
+      ...state.awareness,
+      indicatorVisible: false,
+      activeNotificationId: null
+    }
+  });
   return { ok: true };
 }
 
@@ -894,11 +1615,39 @@ async function handleResume() {
   const state = await getState();
   const extraPaused = Date.now() - (state.pausedAt || Date.now());
   await chrome.runtime.sendMessage({ target: 'offscreen', action: 'resume' });
-  await setState({
+  await persistAndReconcileState({
     status: 'recording',
     pausedAt: 0,
-    pausedDuration: (state.pausedDuration || 0) + extraPaused
+    pausedDuration: (state.pausedDuration || 0) + extraPaused,
+    awareness: {
+      ...state.awareness,
+      lastAudioAt: Date.now()
+    }
   });
+  return { ok: true };
+}
+
+async function handleAudioActivity(message = {}) {
+  const state = await getState();
+  const sessionId = typeof message.sessionId === 'string' ? message.sessionId : null;
+  const at = Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now();
+
+  if (
+    state.status !== 'recording'
+    || !sessionId
+    || !state.awareness.sessionId
+    || state.awareness.sessionId !== sessionId
+  ) {
+    return { ok: true, ignored: true };
+  }
+
+  await persistAndReconcileState({
+    awareness: {
+      ...state.awareness,
+      lastAudioAt: Math.max(state.awareness.lastAudioAt || 0, at)
+    }
+  }, { now: at });
+
   return { ok: true };
 }
 
@@ -908,9 +1657,21 @@ async function handleReset() {
     await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
     setTimeout(() => closeOffscreen(), 1000);
   }
-  await setState({ status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0, tabId: null, tabTitle: '', tabUrl: '' });
+  // Reset behaves like a hard cleanup: clear awareness artifacts and discard any persisted session metadata.
+  await clearRecordingAwarenessArtifacts(state);
+  await setState({
+    status: 'idle',
+    startTime: 0,
+    pausedAt: 0,
+    pausedDuration: 0,
+    tabId: null,
+    tabTitle: '',
+    tabUrl: '',
+    awareness: buildRecordingAwarenessDefaults()
+  });
   await chrome.storage.local.remove('transcript');
   await clearTranscriptSession();
+  await clearTranscriptionProgress();
   return { ok: true };
 }
 
@@ -949,7 +1710,6 @@ async function handleSaveProviderSettings(nextProviderSettings) {
 }
 
 async function handleProcessChunk(message) {
-  const hydratedMessage = hydrateProcessChunkMessage(message);
   const transcriptSession = await getTranscriptSession();
   const chunkLogger = createScopedLogger({
     scope: 'chunk.process',
@@ -975,6 +1735,35 @@ async function handleProcessChunk(message) {
     return { ok: false, error: 'El chunk pertenece a una sesión anterior y se descarta.' };
   }
 
+  let hydratedMessage;
+  try {
+    hydratedMessage = hydrateProcessChunkMessage(message);
+  } catch (error) {
+    const normalizedError = providerErrors && typeof providerErrors.normalizeProviderError === 'function'
+      ? providerErrors.normalizeProviderError(error, { providerId: transcriptSession.activeProvider || 'unknown' })
+      : null;
+
+    await patchTranscriptionProgress((current) => {
+      if (!current || current.sessionId !== transcriptSession.id) {
+        return null;
+      }
+
+      return {
+        completedChunks: Math.min(current.totalChunks, current.completedChunks + 1),
+        status: current.completedChunks + 1 >= current.totalChunks ? 'done' : current.status,
+        updatedAt: Date.now()
+      };
+    });
+    await maybeFinalizeTranscriptionProgress();
+
+    return {
+      ok: false,
+      error: normalizedError && normalizedError.summary ? normalizedError.summary : error.message,
+      code: normalizedError && normalizedError.code ? normalizedError.code : (error.code || 'unsupported'),
+      retryable: !!(normalizedError && normalizedError.retryable)
+    };
+  }
+
   const providerSettings = await readProviderSettings();
   const runtime = providerSessionRuntime && typeof providerSessionRuntime.executeChunkWithFallback === 'function'
     ? providerSessionRuntime
@@ -989,35 +1778,52 @@ async function handleProcessChunk(message) {
     return { ok: false, error: 'No se pudo inicializar el runtime de fallback multi-provider.' };
   }
 
-  const result = await runtime.executeChunkWithFallback({
-    session: transcriptSession,
-    message: hydratedMessage,
-    providerSettings,
-    getProviderAdapter,
-    getProviderLabel,
-    normalizeProviderError: providerErrors && typeof providerErrors.normalizeProviderError === 'function'
-      ? providerErrors.normalizeProviderError
-      : null,
-    appendTranscriptText: saveTranscriptQueued,
-    isHallucination,
-    fetchImpl: fetch.bind(globalThis),
-    setTimeoutImpl: setTimeout,
-    clearTimeoutImpl: clearTimeout,
-    log: chunkLogger
-  });
+  let result;
+  try {
+    result = await runtime.executeChunkWithFallback({
+      session: transcriptSession,
+      message: hydratedMessage,
+      providerSettings,
+      getProviderAdapter,
+      getProviderLabel,
+      normalizeProviderError: providerErrors && typeof providerErrors.normalizeProviderError === 'function'
+        ? providerErrors.normalizeProviderError
+        : null,
+      appendTranscriptText: saveTranscriptQueued,
+      isHallucination,
+      fetchImpl: fetch.bind(globalThis),
+      setTimeoutImpl: setTimeout,
+      clearTimeoutImpl: clearTimeout,
+      log: chunkLogger
+    });
 
-  if (result && result.session) {
-    await setTranscriptSession(result.session);
+    if (result && result.session) {
+      await setTranscriptSession(result.session);
+    }
+
+    return {
+      ok: !!(result && result.ok),
+      providerId: result && result.providerId ? result.providerId : null,
+      transcriptAppended: !!(result && result.transcriptAppended),
+      error: result && result.error ? result.error : undefined,
+      code: result && result.code ? result.code : undefined,
+      retryable: !!(result && result.retryable)
+    };
+  } finally {
+    await patchTranscriptionProgress((current) => {
+      if (!current || current.sessionId !== transcriptSession.id) {
+        return null;
+      }
+
+      const nextCompletedChunks = Math.min(current.totalChunks, current.completedChunks + 1);
+      return {
+        completedChunks: nextCompletedChunks,
+        status: nextCompletedChunks >= current.totalChunks ? 'done' : current.status,
+        updatedAt: Date.now()
+      };
+    });
+    await maybeFinalizeTranscriptionProgress();
   }
-
-  return {
-    ok: !!(result && result.ok),
-    providerId: result && result.providerId ? result.providerId : null,
-    transcriptAppended: !!(result && result.transcriptAppended),
-    error: result && result.error ? result.error : undefined,
-    code: result && result.code ? result.code : undefined,
-    retryable: !!(result && result.retryable)
-  };
 }
 
 // ── Auto-save transcript to history ──
@@ -1118,4 +1924,23 @@ function downloadAudio(dataUrl) {
     filename: `pochoclo-${ts}.webm`,
     saveAs: true
   });
+}
+
+if (typeof module === 'object' && module.exports) {
+  module.exports = {
+    buildRecordingAwarenessDefaults,
+    buildRecordingInactivityAlarmName,
+    buildRecordingReminderAlarmName,
+    calculateRecordingInactivityDeadline,
+    handleInactivityAlarm,
+    getTranscriptionProgress,
+    handleProcessChunk,
+    handleReminderAlarm,
+    maybeFinalizeTranscriptionProgress,
+    normalizeRecordingState,
+    parseRecordingAwarenessAlarmName,
+    patchTranscriptionProgress,
+    setTranscriptionProgress,
+    syncTranscriptionProgress
+  };
 }

@@ -48,3 +48,25 @@ test('popup detail view exposes summary action and render mounts', () => {
     assert.match(html, new RegExp(`id=["']${id}["']`), `missing #${id} in popup.html`);
   });
 });
+
+test('popup exposes transcription progress container mounts above transcript box', () => {
+  const html = readPopupHtml();
+
+  [
+    'transcriptionProgress',
+    'progressText',
+    'progressRatio'
+  ].forEach((id) => {
+    assert.match(html, new RegExp(`id=["']${id}["']`), `missing #${id} in popup.html`);
+  });
+
+  ['progressBarFill', 'progress-bar-container', 'progress-bar-fill'].forEach((token) => {
+    assert.doesNotMatch(html, new RegExp(token), `unexpected ${token} in popup.html`);
+  });
+
+  assert.match(
+    html,
+    /id=["']transcriptionProgress["'][\s\S]*id=["']transcriptBox["']/,
+    'progress container should render before #transcriptBox'
+  );
+});

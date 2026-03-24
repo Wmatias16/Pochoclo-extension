@@ -314,6 +314,45 @@
       cursor: not-allowed;
     }
 
+    .transcription-progress {
+      display: none;
+      margin-bottom: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(239, 68, 68, 0.05);
+      border: 1px solid rgba(220, 38, 38, 0.08);
+    }
+
+    .transcription-progress.is-complete {
+      background: rgba(22, 163, 74, 0.07);
+      border-color: rgba(22, 163, 74, 0.14);
+    }
+
+    .progress-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .progress-text {
+      font-weight: 600;
+      color: #b91c1c;
+    }
+
+    .transcription-progress.is-complete .progress-text {
+      color: #15803d;
+    }
+
+    .progress-ratio {
+      color: #6b7280;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
     .transcript-box {
       background: #f9fafb;
       border: 1px solid #e5e7eb;
@@ -1283,6 +1322,12 @@
     <div class="transcript-header">
       <span class="transcript-title">Transcripción</span>
       <button class="transcript-copy" id="btnCopy" disabled>Copiar</button>
+    </div>
+    <div id="transcriptionProgress" class="transcription-progress" style="display: none;">
+      <div class="progress-label">
+        <span id="progressText" class="progress-text">Transcribiendo...</span>
+        <span id="progressRatio" class="progress-ratio">0/0 clips procesados</span>
+      </div>
     </div>
     <div class="transcript-box" id="transcriptBox">
       <div class="transcript-placeholder" id="placeholder">

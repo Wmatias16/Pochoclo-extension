@@ -18,6 +18,9 @@ const ctx = visualizerCanvas.getContext('2d');
 const transcriptBox = document.getElementById('transcriptBox');
 const transcriptText = document.getElementById('transcriptText');
 const placeholder = document.getElementById('placeholder');
+const transcriptionProgressEl = document.getElementById('transcriptionProgress');
+const progressTextEl = document.getElementById('progressText');
+const progressRatioEl = document.getElementById('progressRatio');
 
 // Views & navigation
 const viewRecorder = document.getElementById('viewRecorder');
@@ -55,6 +58,8 @@ let providerCatalog = [];
 let providerSettingsState = null;
 let liveSessionState = null;
 let detailSummaryRequest = { id: null, status: 'idle', error: null };
+let currentProgressState = null;
+let storageChangeListener = null;
 
 const popupSummaryUi = globalThis.PochoclaPopupSummaryUI || null;
 
@@ -184,6 +189,151 @@ function formatDuration(sec) {
 
 function cloneValue(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function normalizeProgress(progress) {
+  if (!progress || typeof progress !== 'object') {
+    return null;
+  }
+
+  return {
+    sessionId: typeof progress.sessionId === 'string' && progress.sessionId.trim().length > 0
+      ? progress.sessionId.trim()
+      : null,
+    totalChunks: Math.max(0, Number.isFinite(Number(progress.totalChunks)) ? Number(progress.totalChunks) : 0),
+    completedChunks: Math.max(0, Number.isFinite(Number(progress.completedChunks)) ? Number(progress.completedChunks) : 0),
+    status: typeof progress.status === 'string' ? progress.status : 'idle',
+    updatedAt: Number.isFinite(Number(progress.updatedAt)) ? Number(progress.updatedAt) : 0
+  };
+}
+
+function isProgressVisible(progress) {
+  return !!(
+    progress
+    && progress.totalChunks > 0
+    && (progress.status === 'active' || progress.status === 'draining')
+  );
+}
+
+function isProgressComplete(progress) {
+  return !!(
+    progress
+    && progress.totalChunks > 0
+    && progress.completedChunks >= progress.totalChunks
+  );
+}
+
+function showProgressContainer() {
+  if (!transcriptionProgressEl) return;
+  transcriptionProgressEl.style.display = 'block';
+}
+
+function hideProgressContainer() {
+  if (!transcriptionProgressEl) return;
+  transcriptionProgressEl.style.display = 'none';
+  transcriptionProgressEl.classList.remove('is-complete');
+}
+
+function setProgressCopy(label, ratio) {
+  if (progressTextEl) progressTextEl.textContent = label;
+  if (progressRatioEl) progressRatioEl.textContent = ratio;
+}
+
+function renderProgress(progressInput) {
+  const previousProgress = currentProgressState;
+  const progress = normalizeProgress(progressInput);
+
+  if (!transcriptionProgressEl || !progressTextEl || !progressRatioEl) {
+    return;
+  }
+
+  if (
+    progress
+    && progress.status === 'active'
+    && progress.totalChunks <= 0
+    && (!previousProgress || progress.sessionId !== previousProgress.sessionId || isProgressComplete(previousProgress))
+  ) {
+    currentProgressState = progress;
+    setProgressCopy('Transcribiendo...', '0/0 clips procesados');
+    hideProgressContainer();
+    return;
+  }
+
+  if (!progress) {
+    if (isProgressComplete(previousProgress)) {
+      currentProgressState = previousProgress;
+      const ratioText = `${previousProgress.totalChunks}/${previousProgress.totalChunks} clips procesados`;
+      transcriptionProgressEl.classList.add('is-complete');
+      setProgressCopy(`✓ ${ratioText}`, ratioText);
+      showProgressContainer();
+      return;
+    }
+
+    currentProgressState = null;
+    setProgressCopy('Transcribiendo...', '0/0 clips procesados');
+    hideProgressContainer();
+    return;
+  }
+
+  currentProgressState = progress;
+  const completedChunks = Math.min(progress.completedChunks, progress.totalChunks);
+  const ratioText = `${completedChunks}/${progress.totalChunks} clips procesados`;
+
+  if (isProgressComplete(progress)) {
+    transcriptionProgressEl.classList.add('is-complete');
+    setProgressCopy(`✓ ${ratioText}`, ratioText);
+    showProgressContainer();
+    return;
+  }
+
+  if (progress.totalChunks <= 0 || progress.status === 'idle') {
+    setProgressCopy('Transcribiendo...', '0/0 clips procesados');
+    hideProgressContainer();
+    return;
+  }
+
+  transcriptionProgressEl.classList.toggle('is-complete', false);
+
+  if (!isProgressVisible(progress)) {
+    setProgressCopy('Transcribiendo...', ratioText);
+    hideProgressContainer();
+    return;
+  }
+
+  setProgressCopy('Transcribiendo...', ratioText);
+  showProgressContainer();
+}
+
+function handleStorageChange(changes, areaName) {
+  if (areaName !== 'local' || !changes || !changes.transcriptionProgress) {
+    return;
+  }
+
+  const nextProgress = changes.transcriptionProgress.newValue;
+  renderProgress(nextProgress);
+}
+
+function subscribeToProgressChanges() {
+  if (!chrome || !chrome.storage || !chrome.storage.onChanged || typeof chrome.storage.onChanged.addListener !== 'function') {
+    return;
+  }
+
+  if (!storageChangeListener) {
+    storageChangeListener = handleStorageChange;
+    chrome.storage.onChanged.addListener(storageChangeListener);
+  }
+}
+
+function unsubscribeFromProgressChanges() {
+  if (!storageChangeListener) {
+    return;
+  }
+
+  if (chrome && chrome.storage && chrome.storage.onChanged && typeof chrome.storage.onChanged.removeListener === 'function') {
+    chrome.storage.onChanged.removeListener(storageChangeListener);
+  }
+
+  storageChangeListener = null;
 }
 
 function getProviderLabel(providerId) {
@@ -960,15 +1110,18 @@ async function saveProviderSettingsFromUI() {
 
 // ── Init ──
 async function init() {
-  const [state] = await Promise.all([
+  const [state, storageState] = await Promise.all([
     sendBg('getState'),
+    chrome.storage.local.get(['transcript', 'audioLanguage', 'transcriptionProgress']),
     loadProviderSettings(),
     refreshTranscriptSession()
   ]);
 
   applyUI(state || { status: 'idle' });
+  renderProgress(storageState && storageState.transcriptionProgress);
+  subscribeToProgressChanges();
 
-  const { transcript } = await chrome.storage.local.get('transcript');
+  const transcript = storageState && storageState.transcript;
   if (transcript && (transcript.final || transcript.interim)) {
     placeholder.style.display = 'none';
     transcriptText.textContent = transcript.final || '';
@@ -976,13 +1129,19 @@ async function init() {
     if (transcript.final || transcript.interim) btnCopy.disabled = false;
   }
 
-  const { audioLanguage } = await chrome.storage.local.get('audioLanguage');
+  const audioLanguage = storageState && storageState.audioLanguage;
   if (audioLanguage) {
     langSelect.value = audioLanguage;
   }
 }
 
 init();
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('unload', () => {
+    unsubscribeFromProgressChanges();
+  });
+}
 
 // ── Button handlers ──
 btnRecord.addEventListener('click', async () => {
@@ -1007,6 +1166,13 @@ btnRecord.addEventListener('click', async () => {
     }
 
     clearTranscriptUI();
+    renderProgress({
+      sessionId: resp && resp.transcriptSession ? resp.transcriptSession.id : null,
+      totalChunks: 0,
+      completedChunks: 0,
+      status: 'active',
+      updatedAt: Date.now()
+    });
     await refreshTranscriptSession();
     const newState = await sendBg('getState');
     applyUI(newState);
@@ -1043,6 +1209,7 @@ btnReset.addEventListener('click', async () => {
   const newState = await sendBg('getState');
   applyUI(newState);
   clearTranscriptUI();
+  renderProgress(null);
 });
 
 btnCopy.addEventListener('click', () => {

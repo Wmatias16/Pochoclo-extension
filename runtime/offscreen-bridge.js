@@ -55,10 +55,16 @@
     });
   }
 
-  function buildProcessChunkMessage(audio, sessionContext = {}) {
+  function buildBackgroundMessage(action, payload = {}) {
     return {
       target: 'background',
-      action: 'processChunk',
+      action,
+      ...(payload && typeof payload === 'object' ? payload : {})
+    };
+  }
+
+  function buildProcessChunkMessage(audio, sessionContext = {}) {
+    return buildBackgroundMessage('processChunk', {
       audio,
       audioMetadata: audio
         ? {
@@ -69,24 +75,51 @@
         : null,
       sessionId: sessionContext.sessionId || null,
       chunkIndex: Number.isFinite(Number(sessionContext.chunkIndex)) ? Number(sessionContext.chunkIndex) : 0
-    };
+    });
   }
 
-  async function dispatchChunkToBackground(input = {}) {
-    if (typeof input.sendMessage !== 'function') {
+  function buildSyncTranscriptionProgressMessage(progress = {}) {
+    return buildBackgroundMessage('syncTranscriptionProgress', {
+      sessionId: progress.sessionId || null,
+      totalChunks: Number.isFinite(Number(progress.totalChunks)) ? Number(progress.totalChunks) : 0,
+      status: typeof progress.status === 'string' ? progress.status : 'idle',
+      updatedAt: Number.isFinite(Number(progress.updatedAt)) ? Number(progress.updatedAt) : Date.now()
+    });
+  }
+
+  function dispatchToBackground(message, sendMessage) {
+    if (typeof sendMessage !== 'function') {
       throw new Error('Falta el bridge de mensajes hacia background');
     }
 
-    return input.sendMessage(buildProcessChunkMessage(
-      await serializeChunkBlob(input.blob),
-      input.sessionContext
-    ));
+    return sendMessage(message);
+  }
+
+  async function dispatchChunkToBackground(input = {}) {
+    return dispatchToBackground(
+      buildProcessChunkMessage(
+        await serializeChunkBlob(input.blob),
+        input.sessionContext
+      ),
+      input.sendMessage
+    );
+  }
+
+  function dispatchTranscriptionProgressToBackground(input = {}) {
+    return dispatchToBackground(
+      buildSyncTranscriptionProgressMessage(input.progress),
+      input.sendMessage
+    );
   }
 
   return {
+    buildBackgroundMessage,
     buildProcessChunkMessage,
+    buildSyncTranscriptionProgressMessage,
     deserializeChunkBlob,
+    dispatchToBackground,
     serializeChunkBlob,
-    dispatchChunkToBackground
+    dispatchChunkToBackground,
+    dispatchTranscriptionProgressToBackground
   };
 });

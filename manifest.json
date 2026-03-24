@@ -5,6 +5,7 @@
   "version": "1.0.0",
   "icons": {
     "16": "icons/logo.png",
+    "32": "icons/logo.png",
     "48": "icons/logo.png",
     "128": "icons/logo.png"
   },
@@ -12,13 +13,15 @@
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/logo.png",
-      "48": "icons/logo.png",
-      "128": "icons/logo.png"
+      "32": "icons/logo.png",
+      "48": "icons/logo.png"
     },
     "default_title": "Pochoclo - Transcriptor"
   },
   "permissions": [
     "activeTab",
+    "alarms",
+    "notifications",
     "tabs",
     "tabCapture",
     "offscreen",
@@ -32,7 +35,19 @@
     "https://api.groq.com/*",
     "https://speech.googleapis.com/*",
     "http://127.0.0.1:*/*",
-    "http://localhost:*/*"
+    "http://localhost:*/*",
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
   ],
   "background": {
     "service_worker": "background.js"

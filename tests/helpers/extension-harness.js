@@ -15,6 +15,7 @@ const OFFSCREEN_PATH = path.resolve(__dirname, '..', '..', 'offscreen.js');
 
 function createStorageArea(initial = {}) {
   const store = { ...initial };
+  const changeListeners = new Set();
 
   function readKey(key) {
     return store[key];
@@ -52,7 +53,17 @@ function createStorageArea(initial = {}) {
       return Promise.resolve(result);
     },
     set(items, callback) {
+      const changes = {};
+      Object.entries(items || {}).forEach(([key, value]) => {
+        changes[key] = {
+          oldValue: store[key],
+          newValue: value
+        };
+      });
       Object.assign(store, items || {});
+      if (Object.keys(changes).length > 0) {
+        Array.from(changeListeners).forEach((listener) => listener(changes, 'local'));
+      }
       if (typeof callback === 'function') {
         callback();
       }
@@ -60,27 +71,59 @@ function createStorageArea(initial = {}) {
     },
     remove(keys, callback) {
       const list = Array.isArray(keys) ? keys : [keys];
+      const changes = {};
       list.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(store, key)) {
+          changes[key] = {
+            oldValue: store[key],
+            newValue: undefined
+          };
+        }
         delete store[key];
       });
+      if (Object.keys(changes).length > 0) {
+        Array.from(changeListeners).forEach((listener) => listener(changes, 'local'));
+      }
       if (typeof callback === 'function') {
         callback();
       }
       return Promise.resolve();
+    },
+    __addChangeListener(listener) {
+      changeListeners.add(listener);
+    },
+    __removeChangeListener(listener) {
+      changeListeners.delete(listener);
+    },
+    __emitChange(changes, areaName = 'local') {
+      Array.from(changeListeners).forEach((listener) => listener(changes, areaName));
+    },
+    __getChangeListenerCount() {
+      return changeListeners.size;
     }
   };
 }
 
 function createChromeMock(storageArea) {
-  const listeners = [];
+  const runtimeListeners = [];
+  const alarmListeners = [];
+  const notificationButtonListeners = [];
+  const startupListeners = [];
+  const installedListeners = [];
   const sentMessages = [];
+  const actionCalls = [];
+  const createdAlarms = new Map();
+  const clearedAlarms = [];
+  const createdNotifications = [];
+  const clearedNotifications = [];
+  const tabMessages = [];
   let hasOffscreenDocument = false;
 
   function cloneMessage(message) {
     return JSON.parse(JSON.stringify(message));
   }
 
-  function deliverMessage(message) {
+  function deliverMessage(message, sender = {}) {
     const clonedMessage = cloneMessage(message);
     return new Promise((resolve) => {
       let settled = false;
@@ -93,8 +136,8 @@ function createChromeMock(storageArea) {
         }
       };
 
-      for (const listener of listeners) {
-        const result = listener(clonedMessage, {}, sendResponse);
+      for (const listener of runtimeListeners) {
+        const result = listener(clonedMessage, sender, sendResponse);
         if (result === true) {
           handled = true;
           break;
@@ -120,13 +163,44 @@ function createChromeMock(storageArea) {
   }
 
   const chrome = {
-    __listeners: listeners,
+    __listeners: runtimeListeners,
     __sentMessages: sentMessages,
+    __actionCalls: actionCalls,
+    __createdAlarms: createdAlarms,
+    __clearedAlarms: clearedAlarms,
+    __createdNotifications: createdNotifications,
+    __clearedNotifications: clearedNotifications,
+    __tabMessages: tabMessages,
+    __deliverRuntimeMessage(message, sender) {
+      return deliverMessage(message, sender);
+    },
+    __dispatchAlarm(alarm) {
+      alarmListeners.forEach((listener) => listener(alarm));
+    },
+    __dispatchNotificationButton(notificationId, buttonIndex) {
+      notificationButtonListeners.forEach((listener) => listener(notificationId, buttonIndex));
+    },
+    __dispatchStartup() {
+      startupListeners.forEach((listener) => listener());
+    },
+    __dispatchInstalled(details = { reason: 'update' }) {
+      installedListeners.forEach((listener) => listener(details));
+    },
     runtime: {
       lastError: null,
       onMessage: {
         addListener(listener) {
-          listeners.push(listener);
+          runtimeListeners.push(listener);
+        }
+      },
+      onStartup: {
+        addListener(listener) {
+          startupListeners.push(listener);
+        }
+      },
+      onInstalled: {
+        addListener(listener) {
+          installedListeners.push(listener);
         }
       },
       async getContexts(query = {}) {
@@ -173,7 +247,64 @@ function createChromeMock(storageArea) {
         return undefined;
       }
     },
+    action: {
+      async setBadgeText(payload) {
+        actionCalls.push({ method: 'setBadgeText', payload });
+      },
+      async setBadgeBackgroundColor(payload) {
+        actionCalls.push({ method: 'setBadgeBackgroundColor', payload });
+      },
+      async setTitle(payload) {
+        actionCalls.push({ method: 'setTitle', payload });
+      },
+      async setIcon(payload) {
+        actionCalls.push({ method: 'setIcon', payload });
+      }
+    },
+    alarms: {
+      onAlarm: {
+        addListener(listener) {
+          alarmListeners.push(listener);
+        }
+      },
+      async create(name, info) {
+        createdAlarms.set(name, { name, ...(info || {}) });
+      },
+      async clear(name) {
+        clearedAlarms.push(name);
+        return createdAlarms.delete(name);
+      }
+    },
+    notifications: {
+      onButtonClicked: {
+        addListener(listener) {
+          notificationButtonListeners.push(listener);
+        }
+      },
+      async create(notificationId, options) {
+        createdNotifications.push({ notificationId, options });
+        return notificationId;
+      },
+      async clear(notificationId) {
+        clearedNotifications.push(notificationId);
+        return true;
+      }
+    },
+    tabs: {
+      async sendMessage(tabId, message) {
+        tabMessages.push({ tabId, message: cloneMessage(message) });
+        return { ok: true };
+      }
+    },
     storage: {
+      onChanged: {
+        addListener(listener) {
+          storageArea.__addChangeListener(listener);
+        },
+        removeListener(listener) {
+          storageArea.__removeChangeListener(listener);
+        }
+      },
       local: storageArea
     }
   };
@@ -260,6 +391,45 @@ class FakeMediaRecorder {
   }
 }
 
+class FakeOffscreenCanvasContext {
+  constructor(width, height) {
+    this.width = width;
+    this.height = height;
+    this.fillStyle = '#000000';
+  }
+
+  clearRect() {}
+
+  beginPath() {}
+
+  arc() {}
+
+  fill() {}
+
+  getImageData(x, y, width, height) {
+    return {
+      data: new Uint8ClampedArray(width * height * 4),
+      width,
+      height
+    };
+  }
+}
+
+class FakeOffscreenCanvas {
+  constructor(width, height) {
+    this.width = width;
+    this.height = height;
+  }
+
+  getContext(type) {
+    if (type !== '2d') {
+      return null;
+    }
+
+    return new FakeOffscreenCanvasContext(this.width, this.height);
+  }
+}
+
 function createAdapter(providerId, behavior = {}) {
   const adapter = {
     async summarizeText(input, deps) {
@@ -334,6 +504,7 @@ function createHarness(options = {}) {
     navigator: global.navigator,
     AudioContext: global.AudioContext,
     MediaRecorder: global.MediaRecorder,
+    OffscreenCanvas: global.OffscreenCanvas,
     setTimeout: global.setTimeout,
     clearTimeout: global.clearTimeout,
     setInterval: global.setInterval,
@@ -386,6 +557,7 @@ function createHarness(options = {}) {
   });
   setGlobalValue('AudioContext', FakeAudioContext);
   setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('OffscreenCanvas', FakeOffscreenCanvas);
   setGlobalValue('setTimeout', unrefSetTimeout);
   setGlobalValue('clearTimeout', originals.clearTimeout);
   setGlobalValue('setInterval', unrefSetInterval);
@@ -506,6 +678,21 @@ function createHarness(options = {}) {
     getTranscriptions,
     dispatchChunk,
     summarizeTranscription,
+    dispatchAlarm(alarm) {
+      chrome.__dispatchAlarm(alarm);
+    },
+    dispatchNotificationButton(notificationId, buttonIndex) {
+      chrome.__dispatchNotificationButton(notificationId, buttonIndex);
+    },
+    dispatchStartup() {
+      chrome.__dispatchStartup();
+    },
+    dispatchInstalled(details) {
+      chrome.__dispatchInstalled(details);
+    },
+    sendRuntimeMessageAs(message, sender) {
+      return chrome.__deliverRuntimeMessage(message, sender);
+    },
     dispose
   };
 }

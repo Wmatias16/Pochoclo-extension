@@ -359,3 +359,331 @@ test('offscreen capture keeps emitting chunks while the first background respons
     });
   }
 });
+
+test('offscreen throttles audioActivity heartbeats and resets them across pause/resume', async () => {
+  const sentMessages = [];
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => ({ ok: true })
+  });
+  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+  chrome.runtime.sendMessage = (message, callback) => {
+    sentMessages.push(message);
+    return originalSendMessage(message, callback);
+  };
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    DateNow: Date.now
+  };
+
+  let nowValue = 1_000;
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return {
+          getTracks() {
+            return [{ stop() {} }];
+          }
+        };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  Date.now = () => nowValue;
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'start',
+      streamId: 'stream-heartbeat',
+      sessionContext: {
+        sessionId: 'session-heartbeat',
+        chunkIntervalMs: 20
+      }
+    });
+
+    assert.equal(started.ok, true);
+
+    await waitFor(() => FakeAudioContext.instances.length > 0, 100);
+    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
+    const loudSamples = [0.2, -0.18, 0.15, -0.1];
+
+    processorNode.emitAudio(loudSamples);
+    nowValue += 500;
+    processorNode.emitAudio(loudSamples);
+    nowValue += 2_600;
+    processorNode.emitAudio(loudSamples);
+
+    const heartbeatsBeforePause = sentMessages.filter(
+      (message) => message && message.target === 'background' && message.action === 'audioActivity'
+    );
+    assert.equal(heartbeatsBeforePause.length, 2);
+    assert.deepEqual(
+      heartbeatsBeforePause.map((message) => message.at),
+      [1_000, 4_100]
+    );
+
+    const paused = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'pause' });
+    assert.equal(paused.ok, true);
+
+    nowValue += 300;
+    processorNode.emitAudio(loudSamples);
+    assert.equal(
+      sentMessages.filter((message) => message && message.target === 'background' && message.action === 'audioActivity').length,
+      2
+    );
+
+    const resumed = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'resume' });
+    assert.equal(resumed.ok, true);
+
+    nowValue += 200;
+    const resumedProcessorNode = FakeAudioContext.instances[0].processorNodes.at(-1);
+    resumedProcessorNode.emitAudio(loudSamples);
+
+    const heartbeatsAfterResume = sentMessages.filter(
+      (message) => message && message.target === 'background' && message.action === 'audioActivity'
+    );
+    assert.equal(heartbeatsAfterResume.length, 3);
+    assert.equal(heartbeatsAfterResume[2].at, 4_600);
+
+    const stopped = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'stop'
+    });
+    assert.deepEqual(stopped, { ok: true });
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Date.now = originals.DateNow;
+    Object.entries(originals)
+      .filter(([key]) => key !== 'DateNow')
+      .forEach(([key, value]) => {
+        setGlobalValue(key, value);
+      });
+  }
+});
+
+test('offscreen uses RMS threshold so isolated spikes do not count as activity', async () => {
+  const sentMessages = [];
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => ({ ok: true })
+  });
+  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+  chrome.runtime.sendMessage = (message, callback) => {
+    sentMessages.push(message);
+    return originalSendMessage(message, callback);
+  };
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    DateNow: Date.now
+  };
+
+  let nowValue = 9_000;
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return {
+          getTracks() {
+            return [{ stop() {} }];
+          }
+        };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  Date.now = () => nowValue;
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'start',
+      streamId: 'stream-rms',
+      sessionContext: {
+        sessionId: 'session-rms',
+        chunkIntervalMs: 20
+      }
+    });
+
+    assert.equal(started.ok, true);
+
+    await waitFor(() => FakeAudioContext.instances.length > 0, 100);
+    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
+
+    processorNode.emitAudio([0.14, 0, 0, 0, 0, 0, 0, 0]);
+    processorNode.emitAudio([0.13, 0, 0, 0, 0, 0, 0, 0]);
+
+    const spikeHeartbeats = sentMessages.filter(
+      (message) => message && message.target === 'background' && message.action === 'audioActivity'
+    );
+    assert.equal(spikeHeartbeats.length, 0);
+
+    nowValue += 3_000;
+    processorNode.emitAudio([0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]);
+
+    const rmsHeartbeats = sentMessages.filter(
+      (message) => message && message.target === 'background' && message.action === 'audioActivity'
+    );
+    assert.equal(rmsHeartbeats.length, 1);
+    assert.equal(rmsHeartbeats[0].at, 12_000);
+
+    const stopped = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'stop'
+    });
+    assert.deepEqual(stopped, { ok: true });
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Date.now = originals.DateNow;
+    Object.entries(originals)
+      .filter(([key]) => key !== 'DateNow')
+      .forEach(([key, value]) => {
+        setGlobalValue(key, value);
+      });
+  }
+});
+
+test('offscreen syncs accepted chunk totals and keeps draining progress visible after stop without counting silent chunks', async () => {
+  const sentMessages = [];
+  let processChunkCalls = 0;
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => {
+      processChunkCalls += 1;
+      await wait(30);
+      return { ok: true };
+    }
+  });
+  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+  chrome.runtime.sendMessage = (message, callback) => {
+    sentMessages.push(message);
+    if (message && message.target === 'background' && message.action === 'syncTranscriptionProgress') {
+      const response = { ok: true };
+      if (typeof callback === 'function') {
+        callback(response);
+        return undefined;
+      }
+      return Promise.resolve(response);
+    }
+    return originalSendMessage(message, callback);
+  };
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge
+  };
+
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return {
+          getTracks() {
+            return [{ stop() {} }];
+          }
+        };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'start',
+      streamId: 'stream-progress',
+      sessionContext: {
+        sessionId: 'session-progress',
+        chunkIntervalMs: 20
+      }
+    });
+    assert.equal(started.ok, true);
+
+    await waitFor(() => FakeAudioContext.instances.length > 0, 100);
+    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
+
+    processorNode.emitAudio([0, 0, 0, 0, 0, 0, 0, 0]);
+    await wait(30);
+    assert.equal(
+      sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length,
+      0
+    );
+
+    processorNode.emitAudio([0.2, -0.18, 0.15, -0.1, 0.08, -0.06, 0.04, -0.02]);
+    await wait(30);
+    processorNode.emitAudio([0.22, -0.2, 0.16, -0.1, 0.07, -0.05, 0.03, -0.02]);
+    await waitFor(
+      () => sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length >= 2,
+      500
+    );
+
+    const activeSnapshots = sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress' && message.status === 'active');
+    assert.equal(activeSnapshots.length >= 2, true);
+    assert.deepEqual(activeSnapshots.map((message) => message.totalChunks), [1, 2]);
+    assert.equal(activeSnapshots.every((message) => message.sessionId === 'session-progress'), true);
+
+    const stopPromise = chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'stop'
+    });
+
+    await waitFor(
+      () => sentMessages.some((message) => message && message.action === 'syncTranscriptionProgress' && message.status === 'draining'),
+      500
+    );
+
+    const drainingSnapshots = sentMessages.filter(
+      (message) => message && message.action === 'syncTranscriptionProgress' && message.status === 'draining'
+    );
+    assert.equal(drainingSnapshots.length >= 1, true);
+    assert.equal(drainingSnapshots.every((message) => message.totalChunks === 2), true);
+    assert.equal(drainingSnapshots.every((message) => message.sessionId === 'session-progress'), true);
+
+    const stopped = await stopPromise;
+    assert.deepEqual(stopped, { ok: true });
+    assert.equal(processChunkCalls >= 2, true);
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Object.entries(originals).forEach(([key, value]) => {
+      setGlobalValue(key, value);
+    });
+  }
+});

@@ -969,6 +969,12 @@ function clearTranscriptUI() {
   lastTranscriptLength = 0;
 }
 
+function clearProgressUI() {
+  currentProgressState = null;
+  setProgressCopy('Transcribiendo...', '0/0 clips procesados');
+  hideProgressContainer();
+}
+
 // ── Provider settings UI ──
 const btnSettings = document.getElementById('btnSettings');
 const settingsPanel = document.getElementById('settingsPanel');
@@ -1117,17 +1123,21 @@ async function init() {
     refreshTranscriptSession()
   ]);
 
-  applyUI(state || { status: 'idle' });
-  renderProgress(storageState && storageState.transcriptionProgress);
-  subscribeToProgressChanges();
+   const resolvedState = state || { status: 'idle' };
 
-  const transcript = storageState && storageState.transcript;
-  if (transcript && (transcript.final || transcript.interim)) {
-    placeholder.style.display = 'none';
-    transcriptText.textContent = transcript.final || '';
-    lastTranscriptLength = (transcript.final || '').length;
-    if (transcript.final || transcript.interim) btnCopy.disabled = false;
-  }
+   applyUI(resolvedState);
+   renderProgress(storageState && storageState.transcriptionProgress);
+   subscribeToProgressChanges();
+
+   const transcript = storageState && storageState.transcript;
+   if (resolvedState.status === 'idle') {
+     clearTranscriptUI();
+   } else if (transcript && (transcript.final || transcript.interim)) {
+     placeholder.style.display = 'none';
+     transcriptText.textContent = transcript.final || '';
+     lastTranscriptLength = (transcript.final || '').length;
+     if (transcript.final || transcript.interim) btnCopy.disabled = false;
+   }
 
   const audioLanguage = storageState && storageState.audioLanguage;
   if (audioLanguage) {
@@ -1183,11 +1193,15 @@ btnRecord.addEventListener('click', async () => {
     applyUI(newState);
     statusBadge.textContent = 'Finalizado';
     timerLabel.textContent = 'Grabación finalizada';
-    const { transcript } = await chrome.storage.local.get('transcript');
-    if (transcript && transcript.final) {
-      updateTranscriptUI(transcript.final, '');
-      showToast('✓ Guardado en historial');
+    clearTranscriptUI();
+    clearProgressUI();
+
+    if (currentView === 'recorder') {
+      showView('history');
+      await loadHistory();
     }
+
+    showToast('✓ Guardado en historial');
   }
 });
 
@@ -1209,7 +1223,7 @@ btnReset.addEventListener('click', async () => {
   const newState = await sendBg('getState');
   applyUI(newState);
   clearTranscriptUI();
-  renderProgress(null);
+  clearProgressUI();
 });
 
 btnCopy.addEventListener('click', () => {

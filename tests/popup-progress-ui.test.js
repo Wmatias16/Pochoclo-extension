@@ -639,3 +639,63 @@ test('popup keeps completed label visible after storage cleanup and resets on ne
   popup.unload();
   assert.equal(popup.storageArea.__getChangeListenerCount(), 0);
 });
+
+test('popup stop clears live transcript and progress, then navigates to refreshed history', async (t) => {
+  const savedTranscriptions = [{
+    id: 'tx-stop-1',
+    title: 'Reunión finalizada',
+    text: 'Texto final completo',
+    url: 'https://example.com/reunion',
+    date: Date.now(),
+    duration: 42,
+    language: 'es',
+    resolvedProvider: 'openai',
+    status: 'completed',
+    providerAudit: null
+  }];
+
+  let getStateCalls = 0;
+  const popup = await loadPopupHarness({
+    stateResponse: () => {
+      getStateCalls += 1;
+      return getStateCalls <= 3
+        ? { status: 'recording', startTime: Date.now() - 2000, pausedAt: 0, pausedDuration: 0 }
+        : { status: 'idle', startTime: 0, pausedAt: 0, pausedDuration: 0 };
+    },
+    initialStorage: {
+      transcript: { final: 'Texto parcial pegado en popup', interim: 'interim visible' },
+      transcriptionProgress: {
+        sessionId: 'session-stop',
+        totalChunks: 3,
+        completedChunks: 2,
+        status: 'draining',
+        updatedAt: 20
+      }
+    },
+    runtimeResponses: {
+      stopCapture: { ok: true },
+      getTranscriptions: () => savedTranscriptions,
+      getTranscriptionSession: { ok: true, transcriptSession: null }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.document.getElementById('btnRecord').dispatchEvent('click');
+  for (let index = 0; index < 8; index += 1) {
+    await popup.flush();
+  }
+
+  assert.equal(popup.document.getElementById('transcriptText').textContent, '');
+  assert.equal(popup.document.getElementById('placeholder').style.display, 'flex');
+  assert.equal(popup.document.getElementById('btnCopy').disabled, true);
+  assert.equal(popup.document.getElementById('transcriptionProgress').style.display, 'none');
+  assert.equal(popup.document.getElementById('progressText').textContent, 'Transcribiendo...');
+  assert.equal(popup.document.getElementById('progressRatio').textContent, '0/0 clips procesados');
+  assert.equal(popup.document.getElementById('viewRecorder').classList.contains('active'), false);
+  assert.equal(popup.document.getElementById('viewHistory').classList.contains('active'), true);
+  assert.equal(popup.document.getElementById('historyCount').textContent, '1');
+  assert.equal(popup.document.getElementById('historyList').children.length, 1);
+  assert.match(popup.document.getElementById('historyList').children[0].innerHTML, /Reunión finalizada/);
+  assert.equal(popup.document.getElementById('statusBadge').textContent, 'Finalizado');
+  assert.equal(popup.document.getElementById('timerLabel').textContent, 'Grabación finalizada');
+});

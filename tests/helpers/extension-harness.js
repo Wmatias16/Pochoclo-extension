@@ -581,6 +581,8 @@ function createHarness(options = {}) {
   loadFresh(OFFSCREEN_PATH);
   loadFresh(BACKGROUND_PATH);
 
+  const popupSender = { url: 'chrome-extension://test-extension-id/popup.html' };
+
   async function startCapture(input = {}) {
     return chrome.runtime.sendMessage({
       target: 'background',
@@ -600,18 +602,18 @@ function createHarness(options = {}) {
   }
 
   async function saveProviderSettings(providerSettings) {
-    return chrome.runtime.sendMessage({
+    return chrome.__deliverRuntimeMessage({
       target: 'background',
       action: 'saveProviderSettings',
       providerSettings
-    });
+    }, popupSender);
   }
 
   async function getProviderSettings() {
-    return chrome.runtime.sendMessage({
+    return chrome.__deliverRuntimeMessage({
       target: 'background',
       action: 'getProviderSettings'
-    });
+    }, popupSender);
   }
 
   async function getTranscriptSession() {

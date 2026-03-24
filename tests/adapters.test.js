@@ -258,7 +258,8 @@ test('deepgram and google adapt transport metadata for wav chunks', async () => 
     },
     {
       fetchImpl: async (url, options) => {
-        assert.match(url, /speech:recognize\?key=gg-key/);
+        assert.equal(url, 'https://speech.googleapis.com/v1/speech:recognize');
+        assert.equal(options.headers['X-Goog-Api-Key'], 'gg-key');
         const body = JSON.parse(options.body);
         assert.equal(body.config.encoding, 'LINEAR16');
         assert.equal(body.config.sampleRateHertz, 16000);
@@ -338,7 +339,8 @@ test('google adapter sends recognize request with base64 audio', async () => {
     },
     {
       fetchImpl: async (url, options) => {
-        assert.match(url, /speech:recognize\?key=gg-key/);
+        assert.equal(url, 'https://speech.googleapis.com/v1/speech:recognize');
+        assert.equal(options.headers['X-Goog-Api-Key'], 'gg-key');
         const body = JSON.parse(options.body);
         assert.equal(body.config.encoding, 'WEBM_OPUS');
         assert.equal(body.config.languageCode, 'es-ES');

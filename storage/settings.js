@@ -79,6 +79,15 @@
     return settings;
   }
 
+  async function cleanupLegacyOpenAiKey(area, legacyOpenAiKey) {
+    if (!hasText(legacyOpenAiKey) || !area || typeof area.remove !== 'function') {
+      return false;
+    }
+
+    await area.remove('openaiApiKey');
+    return true;
+  }
+
   async function readProviderSettings(storageArea, options = {}) {
     const area = storageArea || chrome.storage.local;
     const data = await area.get(['providerSettings', 'openaiApiKey']);
@@ -87,6 +96,7 @@
     if (!data.providerSettings && hasText(data.openaiApiKey)) {
       const migrated = migrateLegacyOpenAiKey(data.openaiApiKey);
       await area.set({ providerSettings: migrated });
+      await cleanupLegacyOpenAiKey(area, data.openaiApiKey);
       logEvent(logger, 'info', 'settings.legacy-openai-migrated', {
         defaultProvider: migrated.defaultProvider,
         openaiEnabled: !!migrated.providers.openai.enabled,
@@ -107,6 +117,7 @@
     const serializedNormalized = JSON.stringify(normalized);
     if (serializedRaw !== serializedNormalized) {
       await area.set({ providerSettings: normalized });
+      await cleanupLegacyOpenAiKey(area, data.openaiApiKey);
       logEvent(logger, 'info', 'settings.provider-settings-normalized', {
         migration: hasText(data.openaiApiKey) ? 'compat_merge_or_shape_fix' : 'shape_fix',
         defaultProvider: normalized.defaultProvider,
@@ -115,7 +126,10 @@
           return Object.values(config).some((value) => hasText(value) || value === true);
         }).length
       });
+      return normalized;
     }
+
+    await cleanupLegacyOpenAiKey(area, data.openaiApiKey);
 
     return normalized;
   }

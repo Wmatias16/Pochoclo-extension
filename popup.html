@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Pochoclo - Transcriptor</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    :root {
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    }
 
     * {
       margin: 0;
@@ -16,7 +18,7 @@
     body {
       width: 380px;
       min-height: 520px;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       background: #ffffff;
       color: #1a1a2e;
       overflow-x: hidden;
@@ -302,7 +304,7 @@
       padding: 4px 8px;
       border-radius: 6px;
       transition: all 0.2s ease;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
     }
 
     .transcript-copy:hover {
@@ -447,7 +449,7 @@
       border: 1px solid #e5e7eb;
       border-radius: 8px;
       font-size: 12px;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       outline: none;
       transition: border-color 0.2s ease;
     }
@@ -465,7 +467,7 @@
       font-size: 12px;
       font-weight: 500;
       cursor: pointer;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       transition: background 0.2s ease;
     }
 
@@ -506,7 +508,7 @@
       border: 1px solid #e5e7eb;
       border-radius: 8px;
       font-size: 12px;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       outline: none;
       background: #fff;
       color: #1a1a2e;
@@ -879,7 +881,7 @@
       border: 1px solid transparent;
       border-radius: 8px;
       padding: 6px 10px;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       outline: none;
       transition: border-color 0.2s ease;
       background: transparent;
@@ -895,7 +897,7 @@
       cursor: pointer;
       padding: 4px 8px;
       border-radius: 6px;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       opacity: 0;
       transition: opacity 0.2s ease;
     }
@@ -976,7 +978,7 @@
       font-size: 12px;
       font-weight: 700;
       cursor: pointer;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       transition: all 0.2s ease;
     }
     .detail-summary-action:hover {
@@ -1165,7 +1167,7 @@
       font-size: 12px;
       font-weight: 500;
       cursor: pointer;
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       transition: all 0.2s ease;
       display: flex;
       align-items: center;

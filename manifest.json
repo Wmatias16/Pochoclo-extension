@@ -35,8 +35,7 @@
     "https://api.groq.com/*",
     "https://speech.googleapis.com/*",
     "http://127.0.0.1:*/*",
-    "http://localhost:*/*",
-    "<all_urls>"
+    "http://localhost:*/*"
   ],
   "content_scripts": [
     {
@@ -51,5 +50,8 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'"
   }
 }

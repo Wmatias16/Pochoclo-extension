@@ -12,6 +12,8 @@
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   const INDICATOR_HOST_ID = 'pochoclo-recording-indicator';
+  // The manifest injects this script on <all_urls> so the floating indicator can appear on whichever
+  // tab the user chooses to record. Actual UI rendering still stays gated by background recording state.
   // Open shadow root keeps the floating indicator isolated from page CSS while remaining testable/debuggable.
   const INDICATOR_SHADOW_MODE = 'open';
 

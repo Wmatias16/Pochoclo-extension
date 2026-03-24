@@ -25,6 +25,12 @@ function createStorage(initial = {}) {
     },
     async set(items) {
       Object.assign(store, items);
+    },
+    async remove(keys) {
+      const list = Array.isArray(keys) ? keys : [keys];
+      list.forEach((key) => {
+        delete store[key];
+      });
     }
   };
 }
@@ -45,6 +51,7 @@ test('migrates legacy openai key into provider settings', async () => {
   assert.equal(result.defaultProvider, 'openai');
   assert.equal(result.providers.openai.apiKey, 'sk-legacy');
   assert.equal(storage.store.providerSettings.providers.openai.apiKey, 'sk-legacy');
+  assert.equal(Object.prototype.hasOwnProperty.call(storage.store, 'openaiApiKey'), false);
 });
 
 test('compat reads merge legacy openai key without breaking current provider settings', async () => {
@@ -63,6 +70,7 @@ test('compat reads merge legacy openai key without breaking current provider set
   assert.equal(result.defaultProvider, 'deepgram');
   assert.equal(result.providers.openai.apiKey, 'sk-fallback');
   assert.equal(result.providers.deepgram.apiKey, 'dg-live');
+  assert.equal(Object.prototype.hasOwnProperty.call(storage.store, 'openaiApiKey'), false);
 });
 
 test('saveProviderSettings normalizes unknown defaults back to openai', async () => {
@@ -112,7 +120,7 @@ test('normalizeProviderSettings preserves per-provider config used by popup UI',
   assert.equal(result.providers.whisperLocal.transcribePath, '/tx');
 });
 
-test('saveProviderSettings persists multi-provider defaults without touching legacy key', async () => {
+test('saveProviderSettings persists multi-provider defaults without mutating legacy key state', async () => {
   const storage = createStorage({ openaiApiKey: 'sk-legacy' });
 
   const result = await saveProviderSettings({
@@ -128,4 +136,20 @@ test('saveProviderSettings persists multi-provider defaults without touching leg
   assert.equal(storage.store.providerSettings.providers.deepgram.apiKey, 'dg-live');
   assert.equal(storage.store.providerSettings.providers.whisperLocal.baseUrl, 'http://127.0.0.1:8765');
   assert.equal(storage.store.openaiApiKey, 'sk-legacy');
+});
+
+test('readProviderSettings removes leftover legacy key even when provider settings are already normalized', async () => {
+  const existing = buildDefaultProviderSettings();
+  existing.providers.openai.apiKey = 'sk-current';
+
+  const storage = createStorage({
+    providerSettings: existing,
+    openaiApiKey: 'sk-legacy-leftover'
+  });
+
+  const result = await readProviderSettings(storage);
+
+  assert.equal(result.providers.openai.apiKey, 'sk-current');
+  assert.equal(storage.store.providerSettings.providers.openai.apiKey, 'sk-current');
+  assert.equal(Object.prototype.hasOwnProperty.call(storage.store, 'openaiApiKey'), false);
 });

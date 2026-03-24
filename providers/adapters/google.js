@@ -43,10 +43,11 @@
     const sampleRateHertz = input.context && Number.isFinite(Number(input.context.audioSampleRate))
       ? Number(input.context.audioSampleRate)
       : undefined;
-    const response = await fetchImpl(`https://speech.googleapis.com/v1/speech:recognize?key=${encodeURIComponent(apiKey)}`, {
+    const response = await fetchImpl('https://speech.googleapis.com/v1/speech:recognize', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey
       },
       body: JSON.stringify({
         config: {

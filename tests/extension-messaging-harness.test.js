@@ -182,7 +182,7 @@ test('start is rejected when no provider is eligible and offscreen never receive
   );
 });
 
-test('background settings messaging persists sanitized provider defaults', { concurrency: false }, async (t) => {
+test('background settings messaging persists sanitized provider defaults and clears migrated legacy keys', { concurrency: false }, async (t) => {
   const harness = createHarness({
     initialStorage: { openaiApiKey: 'sk-legacy-still-there' }
   });
@@ -201,8 +201,51 @@ test('background settings messaging persists sanitized provider defaults', { con
   const fetched = await harness.getProviderSettings();
   assert.equal(fetched.ok, true);
   assert.equal(fetched.providerSettings.defaultProvider, 'deepgram');
-  assert.equal(fetched.providerSettings.providers.deepgram.apiKey, 'dg-live');
-  assert.equal(harness.storageArea.store.openaiApiKey, 'sk-legacy-still-there');
+  assert.equal(fetched.providerSettings.providers.deepgram.apiKey, 'dg-...live');
+  assert.equal(harness.storageArea.store.providerSettings.providers.deepgram.apiKey, 'dg-live');
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageArea.store, 'openaiApiKey'), false);
+});
+
+test('background provider settings reject untrusted runtime senders', { concurrency: false }, async (t) => {
+  const harness = createHarness();
+  t.after(() => harness.dispose());
+
+  const fetched = await harness.sendRuntimeMessageAs(
+    { target: 'background', action: 'getProviderSettings' },
+    { url: 'https://evil.example/leak.html' }
+  );
+
+  assert.equal(fetched.ok, false);
+  assert.match(fetched.error, /Origen no autorizado/i);
+});
+
+test('saving masked provider settings keeps stored secrets intact', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  settings.defaultProvider = 'deepgram';
+  settings.providers.deepgram.model = 'nova-2';
+
+  const harness = createHarness({
+    initialStorage: { providerSettings: settings }
+  });
+  t.after(() => harness.dispose());
+
+  const saved = await harness.saveProviderSettings({
+    defaultProvider: 'deepgram',
+    providers: {
+      openai: { enabled: true, apiKey: 'sk-...enai' },
+      deepgram: { enabled: true, apiKey: 'dg-...-key', model: 'nova-3' },
+      assemblyai: { enabled: true, apiKey: 'aa-...-key' },
+      groq: { enabled: true, apiKey: 'gsk_...-key' },
+      google: { enabled: true, apiKey: 'gg-...-key' },
+      whisperLocal: { enabled: false, baseUrl: 'http://127.0.0.1:8765', healthPath: '/health', transcribePath: '/transcribe' }
+    }
+  });
+
+  assert.equal(saved.ok, true);
+  assert.equal(saved.providerSettings.providers.deepgram.apiKey, 'dg-...-key');
+  assert.equal(saved.providerSettings.providers.deepgram.model, 'nova-3');
+  assert.equal(harness.storageArea.store.providerSettings.providers.deepgram.apiKey, 'dg-key');
+  assert.equal(harness.storageArea.store.providerSettings.providers.deepgram.model, 'nova-3');
 });
 
 test('fallback exhaustion after three providers stores a failed audit snapshot', { concurrency: false }, async (t) => {
@@ -283,6 +326,7 @@ test('whisper bridge down is skipped at session start and OpenAI legacy migratio
   const started = await harness.startCapture();
   assert.equal(started.ok, true);
   assert.equal(started.transcriptSession.activeProvider, 'openai');
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageArea.store, 'openaiApiKey'), false);
 
   const session = await harness.getTranscriptSession();
   assert.equal(session.audit.skippedProviders[0].providerId, 'whisperLocal');
@@ -294,10 +338,10 @@ test('whisper bridge down is skipped at session start and OpenAI legacy migratio
   const history = await harness.getSavedTranscriptions();
   assert.equal(history[0].resolvedProvider, 'openai');
   assert.equal(harness.storageArea.store.providerSettings.providers.openai.apiKey, 'sk-openai');
-  assert.equal(harness.storageArea.store.openaiApiKey, 'sk-legacy-openai');
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageArea.store, 'openaiApiKey'), false);
 });
 
-test('legacy OpenAI-only storage migrates lazily and remains a valid rollback path', { concurrency: false }, async (t) => {
+test('legacy OpenAI-only storage migrates lazily and removes the old key', { concurrency: false }, async (t) => {
   const harness = createHarness({
     initialStorage: {
       openaiApiKey: 'sk-legacy-only'
@@ -315,6 +359,7 @@ test('legacy OpenAI-only storage migrates lazily and remains a valid rollback pa
   const started = await harness.startCapture();
   assert.equal(started.ok, true);
   assert.equal(started.transcriptSession.activeProvider, 'openai');
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageArea.store, 'openaiApiKey'), false);
 
   await harness.dispatchChunk({ chunkIndex: 1 });
   await harness.stopCapture();
@@ -323,7 +368,7 @@ test('legacy OpenAI-only storage migrates lazily and remains a valid rollback pa
   assert.equal(history.length, 1);
   assert.equal(history[0].resolvedProvider, 'openai');
   assert.equal(harness.storageArea.store.providerSettings.providers.openai.apiKey, 'sk-legacy-only');
-  assert.equal(harness.storageArea.store.openaiApiKey, 'sk-legacy-only');
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageArea.store, 'openaiApiKey'), false);
 });
 
 test('OpenAI sessions request shorter live chunk windows without changing other providers', { concurrency: false }, async (t) => {

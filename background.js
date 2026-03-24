@@ -844,11 +844,10 @@ async function readProviderSettings() {
     });
   }
 
-  const { openaiApiKey } = await chrome.storage.local.get('openaiApiKey');
   return {
     defaultProvider: 'openai',
     providers: {
-      openai: { enabled: !!openaiApiKey, apiKey: openaiApiKey || '' }
+      openai: { enabled: false, apiKey: '' }
     }
   };
 }
@@ -862,6 +861,92 @@ async function saveProviderSettings(nextSettings) {
 
   await chrome.storage.local.set({ providerSettings: nextSettings });
   return nextSettings;
+}
+
+function isExtensionPageUrl(url) {
+  return typeof url === 'string' && /^chrome-extension:\/\/[^/]+\//.test(url);
+}
+
+function isTrustedExtensionPageSender(sender) {
+  return !!(sender && isExtensionPageUrl(sender.url));
+}
+
+function maskSecret(value) {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (!normalized) return '';
+
+  const visibleSuffix = normalized.slice(-4);
+  const separatorIndex = Math.max(normalized.indexOf('-'), normalized.indexOf('_'));
+  const visiblePrefix = separatorIndex >= 0
+    ? normalized.slice(0, separatorIndex + 1)
+    : normalized.slice(0, Math.min(4, Math.max(0, normalized.length - 4)));
+
+  return `${visiblePrefix || ''}...${visibleSuffix}`;
+}
+
+function redactProviderSettings(settings) {
+  if (!settings || typeof settings !== 'object') {
+    return settings;
+  }
+
+  const cloned = JSON.parse(JSON.stringify(settings));
+  const providers = cloned.providers && typeof cloned.providers === 'object'
+    ? cloned.providers
+    : {};
+
+  Object.keys(providers).forEach((providerId) => {
+    const providerConfig = providers[providerId];
+    if (!providerConfig || typeof providerConfig !== 'object') {
+      return;
+    }
+
+    if (typeof providerConfig.apiKey === 'string') {
+      providerConfig.apiKey = maskSecret(providerConfig.apiKey);
+    }
+  });
+
+  return cloned;
+}
+
+function restoreRedactedProviderSecrets(nextSettings, currentSettings) {
+  if (!nextSettings || typeof nextSettings !== 'object') {
+    return nextSettings;
+  }
+
+  const merged = JSON.parse(JSON.stringify(nextSettings));
+  const nextProviders = merged.providers && typeof merged.providers === 'object'
+    ? merged.providers
+    : {};
+  const currentProviders = currentSettings && currentSettings.providers && typeof currentSettings.providers === 'object'
+    ? currentSettings.providers
+    : {};
+
+  Object.keys(nextProviders).forEach((providerId) => {
+    const nextProvider = nextProviders[providerId];
+    const currentProvider = currentProviders[providerId];
+    if (!nextProvider || typeof nextProvider !== 'object' || !currentProvider || typeof currentProvider !== 'object') {
+      return;
+    }
+
+    const currentApiKey = typeof currentProvider.apiKey === 'string' ? currentProvider.apiKey.trim() : '';
+    const nextApiKey = typeof nextProvider.apiKey === 'string' ? nextProvider.apiKey.trim() : '';
+    if (!currentApiKey || !nextApiKey) {
+      return;
+    }
+
+    if (nextApiKey === maskSecret(currentApiKey)) {
+      nextProvider.apiKey = currentApiKey;
+    }
+  });
+
+  return merged;
+}
+
+function buildUnauthorizedProviderSettingsResponse() {
+  return {
+    ok: false,
+    error: 'Origen no autorizado para acceder a la configuración de providers.'
+  };
 }
 
 function getProviderLabel(providerId) {
@@ -1378,16 +1463,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       downloadAudio(msg.dataUrl);
       break;
 
-    case 'getApiKey':
-      handleGetApiKey().then(sendResponse).catch(e => sendResponse({ key: null, language: 'es', error: e.message }));
-      return true;
-
     case 'getProviderSettings':
-      handleGetProviderSettings().then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      handleGetProviderSettings(sender).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
 
     case 'saveProviderSettings':
-      handleSaveProviderSettings(msg.providerSettings).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      handleSaveProviderSettings(msg.providerSettings, sender).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
 
     case 'getTranscriptionSession':
@@ -1502,6 +1583,9 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
     logger: startLogger
   });
 
+  // tabCapture works after a user-invoked extension action and can target tabs granted via activeTab,
+  // so we keep host_permissions narrowed to provider/transcription endpoints instead of <all_urls>.
+  // Chrome docs: chrome.tabCapture.getMediaStreamId({ targetTabId }) only requires activeTab access.
   // Get a stream ID for the given tab
   const streamId = await new Promise((resolve, reject) => {
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
@@ -1675,36 +1759,33 @@ async function handleReset() {
   return { ok: true };
 }
 
-async function handleGetApiKey() {
-  const providerSettings = await readProviderSettings();
-  const transcriptSession = await getTranscriptSession();
-  const { audioLanguage } = await chrome.storage.local.get('audioLanguage');
-  const activeProvider = transcriptSession && transcriptSession.activeProvider ? transcriptSession.activeProvider : 'openai';
-  const key = providerSettings.providers && providerSettings.providers.openai
-    ? providerSettings.providers.openai.apiKey || null
-    : null;
+async function handleGetProviderSettings(sender) {
+  if (!isTrustedExtensionPageSender(sender)) {
+    return buildUnauthorizedProviderSettingsResponse();
+  }
 
-  return {
-    key: activeProvider === 'openai' ? key : null,
-    language: audioLanguage || 'es',
-    providerId: activeProvider
-  };
-}
-
-async function handleGetProviderSettings() {
   const providerSettings = await readProviderSettings();
   return {
     ok: true,
-    providerSettings,
+    providerSettings: redactProviderSettings(providerSettings),
     providers: providerRegistry.listProviders()
   };
 }
 
-async function handleSaveProviderSettings(nextProviderSettings) {
-  const providerSettings = await saveProviderSettings(nextProviderSettings || {});
+async function handleSaveProviderSettings(nextProviderSettings, sender) {
+  if (!isTrustedExtensionPageSender(sender)) {
+    return buildUnauthorizedProviderSettingsResponse();
+  }
+
+  const currentProviderSettings = await readProviderSettings();
+  const providerSettings = await saveProviderSettings(restoreRedactedProviderSecrets(
+    nextProviderSettings || {},
+    currentProviderSettings
+  ));
+
   return {
     ok: true,
-    providerSettings,
+    providerSettings: redactProviderSettings(providerSettings),
     providers: providerRegistry.listProviders()
   };
 }

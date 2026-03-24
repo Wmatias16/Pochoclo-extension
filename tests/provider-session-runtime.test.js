@@ -1,7 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { executeChunkWithFallback, finalizeSession } = require('../runtime/provider-session-runtime.js');
+const {
+  LIVE_SESSION_COMMANDS,
+  executeChunkWithFallback,
+  finalizeSession,
+  routeProviderSessionCommand
+} = require('../runtime/provider-session-runtime.js');
 
 function buildSession() {
   return {
@@ -231,4 +236,129 @@ test('runtime logs preflight failure and fallback rotation for diagnosable trace
   assert.equal(events[2].payload.reason, 'healthcheck_failed');
   assert.equal(events[4].payload.fromProviderId, 'whisperLocal');
   assert.equal(events[4].payload.toProviderId, 'openai');
+});
+
+test('routeProviderSessionCommand preserves batch handling and adds live commands', async () => {
+  const handled = [];
+
+  const processResult = await routeProviderSessionCommand(
+    { action: 'processChunk', chunkIndex: 1 },
+    {
+      processChunk(message) {
+        handled.push(message.action);
+        return { ok: true, mode: 'batch' };
+      },
+      startLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, mode: 'live' };
+      },
+      liveAudioChunk(message) {
+        handled.push(message.action);
+        return { ok: true, mode: 'live-audio' };
+      },
+      flushLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, mode: 'live-flush' };
+      },
+      stopLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, mode: 'live-stop' };
+      }
+    }
+  );
+
+  const liveStartResult = await routeProviderSessionCommand(
+    { action: LIVE_SESSION_COMMANDS.START_LIVE_SESSION, sessionId: 'txs_live' },
+    {
+      startLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, sessionId: message.sessionId };
+      }
+    }
+  );
+
+  const liveAudioResult = await routeProviderSessionCommand(
+    { action: LIVE_SESSION_COMMANDS.LIVE_AUDIO_CHUNK, sessionId: 'txs_live' },
+    {
+      liveAudioChunk(message) {
+        handled.push(message.action);
+        return { ok: true, sessionId: message.sessionId };
+      }
+    }
+  );
+
+  const liveFlushResult = await routeProviderSessionCommand(
+    { action: LIVE_SESSION_COMMANDS.FLUSH_LIVE_SESSION, sessionId: 'txs_live' },
+    {
+      flushLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, sessionId: message.sessionId };
+      }
+    }
+  );
+
+  const liveStopResult = await routeProviderSessionCommand(
+    { action: LIVE_SESSION_COMMANDS.STOP_LIVE_SESSION, sessionId: 'txs_live' },
+    {
+      stopLiveSession(message) {
+        handled.push(message.action);
+        return { ok: true, sessionId: message.sessionId };
+      }
+    }
+  );
+
+  assert.deepEqual(processResult, { ok: true, mode: 'batch' });
+  assert.deepEqual(liveStartResult, { ok: true, sessionId: 'txs_live' });
+  assert.deepEqual(liveAudioResult, { ok: true, sessionId: 'txs_live' });
+  assert.deepEqual(liveFlushResult, { ok: true, sessionId: 'txs_live' });
+  assert.deepEqual(liveStopResult, { ok: true, sessionId: 'txs_live' });
+  assert.deepEqual(handled, ['processChunk', 'startLiveSession', 'liveAudioChunk', 'flushLiveSession', 'stopLiveSession']);
+});
+
+test('offscreen bridge builds live start and transcript event messages for background serialization', () => {
+  const bridge = require('../runtime/offscreen-bridge.js');
+
+  const startMessage = bridge.buildStartLiveSessionMessage({
+    streamId: 'stream-99',
+    sessionId: 'txs_live',
+    providerId: 'deepgram',
+    providerConfig: { liveEnabled: true },
+    audioFormat: 'audio/webm;codecs=opus',
+    sessionContext: { sessionId: 'txs_live', language: 'es' }
+  });
+  const partialMessage = bridge.buildLivePartialMessage({
+    sessionId: 'txs_live',
+    providerId: 'deepgram',
+    text: 'hola parcial'
+  });
+  const finalMessage = bridge.buildLiveFinalMessage({
+    sessionId: 'txs_live',
+    providerId: 'deepgram',
+    text: 'hola final'
+  });
+  const errorMessage = bridge.buildLiveErrorMessage({
+    sessionId: 'txs_live',
+    providerId: 'deepgram',
+    code: 'transport_error',
+    message: 'socket down'
+  });
+  const fallbackMessage = bridge.buildLiveFallbackMessage({
+    sessionId: 'txs_live',
+    providerId: 'deepgram',
+    reason: 'reconnect_exhausted',
+    reconnects: 2
+  });
+
+  assert.equal(startMessage.action, 'startLiveSession');
+  assert.equal(startMessage.streamId, 'stream-99');
+  assert.equal(startMessage.providerId, 'deepgram');
+  assert.equal(startMessage.audioFormat, 'audio/webm;codecs=opus');
+  assert.equal(partialMessage.action, 'livePartial');
+  assert.equal(partialMessage.text, 'hola parcial');
+  assert.equal(finalMessage.action, 'liveFinal');
+  assert.equal(errorMessage.action, 'liveError');
+  assert.equal(errorMessage.code, 'transport_error');
+  assert.equal(fallbackMessage.action, 'liveFallback');
+  assert.equal(fallbackMessage.reason, 'reconnect_exhausted');
+  assert.equal(fallbackMessage.reconnects, 2);
 });

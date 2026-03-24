@@ -4,11 +4,13 @@ const providerErrors = require('../../providers/errors.js');
 const providerRegistry = require('../../providers/registry.js');
 const providerDiagnostics = require('../../diagnostics/provider-logger.js');
 const providerSessionRuntime = require('../../runtime/provider-session-runtime.js');
+const liveProviderSessionRuntime = require('../../runtime/live-provider-session-runtime.js');
 const providerSettingsStore = require('../../storage/settings.js');
 const transcriptionStore = require('../../storage/transcriptions.js');
 const chunkProcessor = require('../../runtime/chunk-processor.js');
 const offscreenBridge = require('../../runtime/offscreen-bridge.js');
 const transcriptionSummarizer = require('../../runtime/transcription-summarizer.js');
+const deepgramLiveTransport = require('../../providers/live/deepgram-live.js');
 
 const BACKGROUND_PATH = path.resolve(__dirname, '..', '..', 'background.js');
 const OFFSCREEN_PATH = path.resolve(__dirname, '..', '..', 'offscreen.js');
@@ -355,10 +357,13 @@ class FakeAudioContext {
 }
 
 class FakeMediaRecorder {
+  static instances = [];
+
   constructor() {
     this.state = 'inactive';
     this.ondataavailable = null;
     this.onstop = null;
+    FakeMediaRecorder.instances.push(this);
   }
 
   start() {
@@ -376,6 +381,12 @@ class FakeMediaRecorder {
         this.onstop();
       }
     });
+  }
+
+  emitData(data) {
+    if (typeof this.ondataavailable === 'function') {
+      this.ondataavailable({ data });
+    }
   }
 
   pause() {
@@ -458,6 +469,51 @@ function createAdapter(providerId, behavior = {}) {
   return adapter;
 }
 
+function createLiveTransport(behavior = {}) {
+  return {
+    createDeepgramLiveTransport() {
+      return {
+        async connect() {
+          if (typeof behavior.connect === 'function') {
+            return behavior.connect();
+          }
+          return true;
+        },
+        async send(payload) {
+          if (typeof behavior.send === 'function') {
+            return behavior.send(payload);
+          }
+          return true;
+        },
+        async close() {
+          if (typeof behavior.close === 'function') {
+            return behavior.close();
+          }
+          return true;
+        },
+        onMessage(callback) {
+          if (typeof behavior.onMessage === 'function') {
+            return behavior.onMessage(callback);
+          }
+          return () => {};
+        },
+        onError(callback) {
+          if (typeof behavior.onError === 'function') {
+            return behavior.onError(callback);
+          }
+          return () => {};
+        },
+        onClose(callback) {
+          if (typeof behavior.onClose === 'function') {
+            return behavior.onClose(callback);
+          }
+          return () => {};
+        }
+      };
+    }
+  };
+}
+
 function setGlobalValue(key, value) {
   if (value === undefined) {
     try {
@@ -485,6 +541,7 @@ function loadFresh(modulePath) {
 }
 
 function createHarness(options = {}) {
+  FakeMediaRecorder.instances.length = 0;
   const storageArea = createStorageArea({
     audioLanguage: 'es',
     ...(options.initialStorage || {})
@@ -515,11 +572,13 @@ function createHarness(options = {}) {
     PochoclaProviderSettings: global.PochoclaProviderSettings,
     PochoclaTranscriptionStorage: global.PochoclaTranscriptionStorage,
     PochoclaProviderSessionRuntime: global.PochoclaProviderSessionRuntime,
+    PochoclaLiveProviderSessionRuntime: global.PochoclaLiveProviderSessionRuntime,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
     PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
     PochoclaTranscriptionSummarizer: global.PochoclaTranscriptionSummarizer,
     PochoclaOpenAIAdapter: global.PochoclaOpenAIAdapter,
     PochoclaDeepgramAdapter: global.PochoclaDeepgramAdapter,
+    PochoclaDeepgramLiveTransport: global.PochoclaDeepgramLiveTransport,
     PochoclaAssemblyAIAdapter: global.PochoclaAssemblyAIAdapter,
     PochoclaGroqAdapter: global.PochoclaGroqAdapter,
     PochoclaGoogleAdapter: global.PochoclaGoogleAdapter,
@@ -568,11 +627,13 @@ function createHarness(options = {}) {
   setGlobalValue('PochoclaProviderSettings', providerSettingsStore);
   setGlobalValue('PochoclaTranscriptionStorage', transcriptionStore);
   setGlobalValue('PochoclaProviderSessionRuntime', providerSessionRuntime);
+  setGlobalValue('PochoclaLiveProviderSessionRuntime', options.liveProviderSessionRuntime || liveProviderSessionRuntime);
   setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
   setGlobalValue('PochoclaTranscriptionSummarizer', transcriptionSummarizer);
   setGlobalValue('PochoclaOpenAIAdapter', createAdapter('openai', adapterBehaviors.openai));
   setGlobalValue('PochoclaDeepgramAdapter', createAdapter('deepgram', adapterBehaviors.deepgram));
+  setGlobalValue('PochoclaDeepgramLiveTransport', createLiveTransport(adapterBehaviors.deepgramLiveTransport));
   setGlobalValue('PochoclaAssemblyAIAdapter', createAdapter('assemblyai', adapterBehaviors.assemblyai));
   setGlobalValue('PochoclaGroqAdapter', createAdapter('groq', adapterBehaviors.groq));
   setGlobalValue('PochoclaGoogleAdapter', createAdapter('google', adapterBehaviors.google));
@@ -626,6 +687,14 @@ function createHarness(options = {}) {
     return transcript || null;
   }
 
+  async function getLiveTranscript(sessionId) {
+    return chrome.runtime.sendMessage({
+      target: 'background',
+      action: 'getLiveTranscript',
+      sessionId
+    });
+  }
+
   async function getSavedTranscriptions() {
     const { savedTranscriptions } = await storageArea.get('savedTranscriptions');
     return savedTranscriptions || [];
@@ -676,6 +745,7 @@ function createHarness(options = {}) {
     getProviderSettings,
     getTranscriptSession,
     getTranscript,
+    getLiveTranscript,
     getSavedTranscriptions,
     getTranscriptions,
     dispatchChunk,

@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 
 const {
   createProviderAuditSnapshot,
+  getLiveTranscript,
+  normalizeTranscription,
   normalizeSavedTranscription,
   normalizeSavedTranscriptions
 } = require('../storage/transcriptions.js');
@@ -199,4 +201,194 @@ test('normalizeSavedTranscriptions logs lazy history normalization migrations', 
   assert.equal(events[0].event, 'transcriptions.history-normalized');
   assert.equal(events[0].payload.migratedEntries, 1);
   assert.equal(events[0].payload.migration, 'lazy_history_normalization');
+});
+
+test('normalizeTranscription preserves explicit values for new live transcript fields', () => {
+  const normalized = normalizeTranscription({
+    final: 'hola final',
+    interim: ' hola parcial ',
+    mode: 'live',
+    fallbackReason: ' reconnect_exhausted ',
+    reconnectCount: '2',
+    terminalStatus: 'completed',
+    providerAttribution: ['deepgram-live', '', 'deepgram-live', 'deepgram-batch'],
+    liveMeta: {
+      reconnectCount: '3',
+      finalSegments: '4',
+      startedAt: 10,
+      endedAt: 20
+    }
+  });
+
+  assert.deepEqual(normalized, {
+    text: 'hola final',
+    final: 'hola final',
+    interim: ' hola parcial ',
+    mode: 'live',
+    fallbackReason: 'reconnect_exhausted',
+    liveMeta: {
+      reconnectCount: 3,
+      finalSegments: 4,
+      startedAt: 10,
+      endedAt: 20
+    },
+    reconnectCount: 2,
+    terminalStatus: 'completed',
+    providerAttribution: ['deepgram-live', 'deepgram-batch'],
+  });
+});
+
+test('createProviderAuditSnapshot keeps sanitized live audit trail and terminal metadata', () => {
+  const snapshot = createProviderAuditSnapshot({
+    mode: 'live',
+    fallbackReason: 'startup_failed',
+    reconnectCount: 2,
+    terminalStatus: 'fallback-to-batch',
+    providerAttribution: ['deepgram-live', 'deepgram-batch'],
+    liveMeta: {
+      reconnectCount: 2,
+      finalSegments: 1,
+      startedAt: 10,
+      endedAt: 20
+    },
+    audit: {
+      liveEvents: [
+        {
+          event: 'live:connect',
+          sessionId: 'tx_live',
+          timestamp: 10,
+          provider: 'deepgram',
+          payload: { apiKey: '[redacted]' }
+        },
+        {
+          event: 'live:partial',
+          sessionId: 'tx_live',
+          timestamp: 11,
+          provider: 'deepgram',
+          payload: { text: '[redacted]' }
+        }
+      ]
+    }
+  });
+
+  assert.equal(snapshot.mode, 'live');
+  assert.equal(snapshot.fallbackReason, 'startup_failed');
+  assert.equal(snapshot.reconnectCount, 2);
+  assert.equal(snapshot.terminalStatus, 'fallback-to-batch');
+  assert.deepEqual(snapshot.providerAttribution, ['deepgram-live', 'deepgram-batch']);
+  assert.equal(snapshot.liveEvents.length, 2);
+  assert.equal(snapshot.liveEvents[0].event, 'live:connect');
+});
+
+test('getLiveTranscript returns active current live transcript for matching session', async () => {
+  const storageArea = {
+    async get(keys) {
+      if (keys === 'currentLiveTranscript') {
+        return {
+          currentLiveTranscript: {
+            sessionId: 'session-live',
+            text: 'hola final ',
+            interim: 'hola interina',
+            mode: 'live'
+          }
+        };
+      }
+
+      return {};
+    }
+  };
+
+  const liveTranscript = await getLiveTranscript('session-live', storageArea);
+
+  assert.deepEqual(liveTranscript, {
+    text: 'hola final ',
+    interim: 'hola interina',
+    mode: 'live'
+  });
+});
+
+test('getLiveTranscript returns null for missing or mismatched current live transcript session', async () => {
+  const missingStorageArea = {
+    async get(keys) {
+      if (keys === 'currentLiveTranscript') {
+        return {};
+      }
+
+      return {};
+    }
+  };
+
+  const mismatchedStorageArea = {
+    async get(keys) {
+      if (keys === 'currentLiveTranscript') {
+        return {
+          currentLiveTranscript: {
+            sessionId: 'other-session',
+            text: 'hola final',
+            interim: 'hola interina',
+            mode: 'live'
+          }
+        };
+      }
+
+      return {};
+    }
+  };
+
+  const missingTranscript = await getLiveTranscript('session-live', missingStorageArea);
+  const mismatchedTranscript = await getLiveTranscript('session-live', mismatchedStorageArea);
+
+  assert.equal(missingTranscript, null);
+  assert.equal(mismatchedTranscript, null);
+});
+
+test('normalizeTranscription includes new live transcript fields with defaults', () => {
+  const normalized = normalizeTranscription({
+    text: 'texto base'
+  });
+
+  assert.deepEqual(normalized, {
+    text: 'texto base',
+    final: 'texto base',
+    interim: '',
+    mode: 'batch',
+    fallbackReason: null,
+    liveMeta: null,
+    reconnectCount: 0,
+    terminalStatus: null,
+    providerAttribution: null
+  });
+});
+
+test('normalizeTranscription preserves explicit values for new fields', () => {
+  const normalized = normalizeTranscription({
+    text: 'texto base',
+    interim: 'texto parcial',
+    mode: 'live',
+    fallbackReason: ' reconnect_exhausted ',
+    liveMeta: {
+      reconnectCount: '3',
+      finalSegments: '4',
+      startedAt: 10,
+      endedAt: 20
+    },
+    reconnectCount: '2',
+    terminalStatus: ' fallback-to-batch ',
+    providerAttribution: ['deepgram-live', '', 'deepgram-batch', 'deepgram-live']
+  });
+
+  assert.equal(normalized.text, 'texto base');
+  assert.equal(normalized.final, 'texto base');
+  assert.equal(normalized.interim, 'texto parcial');
+  assert.equal(normalized.mode, 'live');
+  assert.equal(normalized.fallbackReason, 'reconnect_exhausted');
+  assert.deepEqual(normalized.liveMeta, {
+    reconnectCount: 3,
+    finalSegments: 4,
+    startedAt: 10,
+    endedAt: 20
+  });
+  assert.equal(normalized.reconnectCount, 2);
+  assert.equal(normalized.terminalStatus, 'fallback-to-batch');
+  assert.deepEqual(normalized.providerAttribution, ['deepgram-live', 'deepgram-batch']);
 });

@@ -23,6 +23,15 @@
     'file'
   ];
   const SENSITIVE_SUFFIX_KEYS = ['apikey', 'token', 'secret', 'password', 'blob', 'file'];
+  const LIVE_EVENT_TYPES = new Set([
+    'live:connect',
+    'live:partial',
+    'live:final',
+    'live:error',
+    'live:reconnect',
+    'live:fallback',
+    'live:close'
+  ]);
 
   function normalizeKey(key) {
     return String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -100,6 +109,11 @@
     }, {});
   }
 
+  function normalizeLiveEventType(event) {
+    const normalized = typeof event === 'string' ? event.trim() : '';
+    return LIVE_EVENT_TYPES.has(normalized) ? normalized : 'live:unknown';
+  }
+
   function callSink(sink, level, message, payload) {
     if (!sink) {
       return;
@@ -130,6 +144,9 @@
       info(event, context) {
         return emit('info', event, context);
       },
+      liveEvent(event, context) {
+        return emit('info', normalizeLiveEventType(event), context);
+      },
       warn(event, context) {
         return emit('warn', event, context);
       },
@@ -148,6 +165,7 @@
 
   return {
     createDiagnosticsLogger,
+    LIVE_EVENT_TYPES,
     sanitizeDiagnosticsContext: sanitizeValue
   };
 });

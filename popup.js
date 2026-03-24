@@ -754,6 +754,7 @@ function applyUI(state) {
   clearInterval(timerInterval);
   clearTimeout(waveformInterval);
   cancelAnimationFrame(waveformAnimFrame);
+  clearTimeout(transcriptInterval);
   clearInterval(transcriptInterval);
   timerInterval = null;
   waveformInterval = null;
@@ -842,7 +843,7 @@ function applyUI(state) {
 
     waveformAnimFrame = requestAnimationFrame(drawVisualizer);
 
-    transcriptInterval = setInterval(async () => {
+    const pollTranscript = async () => {
       const [{ transcript }, response] = await Promise.all([
         chrome.storage.local.get('transcript'),
         sendBg('getTranscriptionSession')
@@ -851,10 +852,22 @@ function applyUI(state) {
       liveSessionState = response && response.ok ? response.transcriptSession : null;
       updateProviderLiveChip({ status: 'recording' });
 
-      if (transcript) {
-        updateTranscriptUI(transcript.final || '', transcript.interim || '');
+      const liveTranscript = liveSessionState && liveSessionState.id
+        ? await fetchLiveTranscriptSurface(liveSessionState.id)
+        : null;
+      const finalText = liveTranscript ? (liveTranscript.final || liveTranscript.text || '') : (transcript ? (transcript.final || '') : '');
+      const interimText = liveTranscript ? (liveTranscript.interim || '') : (transcript ? (transcript.interim || '') : '');
+      const transcriptMode = liveTranscript
+        ? (liveTranscript.mode || 'batch')
+        : (transcript ? (transcript.mode || 'batch') : 'batch');
+
+      if (transcript || liveTranscript) {
+        updateTranscriptUI(finalText, interimText, transcriptMode);
       }
-    }, 300);
+      transcriptInterval = setTimeout(pollTranscript, getTranscriptPollIntervalMs(liveSessionState));
+    };
+
+    transcriptInterval = setTimeout(pollTranscript, getTranscriptPollIntervalMs(liveSessionState));
 
     btnRecord.classList.add('recording');
     btnPause.disabled = false;
@@ -918,7 +931,7 @@ function resetWaveBars() {
 // ── Transcript UI helpers ──
 let lastTranscriptLength = 0;
 
-function updateTranscriptUI(finalText, interimText) {
+function updateTranscriptUI(finalText, interimText, mode = 'batch') {
   placeholder.style.display = 'none';
   const newFinal = finalText.slice(lastTranscriptLength);
   if (newFinal) {
@@ -927,19 +940,19 @@ function updateTranscriptUI(finalText, interimText) {
   }
 
   let interimSpan = transcriptText.querySelector('.interim');
-  if (interimText) {
+  const shouldRenderInterim = mode === 'live' && hasText(interimText);
+  if (shouldRenderInterim) {
     if (!interimSpan) {
       interimSpan = document.createElement('span');
-      interimSpan.className = 'interim';
-      interimSpan.style.color = '#9ca3af';
+      interimSpan.classList.add('interim', 'transcript-interim');
       transcriptText.appendChild(interimSpan);
     }
-    interimSpan.textContent = interimText;
+    interimSpan.textContent = ` ${interimText}`;
   } else if (interimSpan) {
     interimSpan.remove();
   }
 
-  if (finalText || interimText) {
+  if (finalText || shouldRenderInterim) {
     btnCopy.disabled = false;
     transcriptBox.scrollTop = transcriptBox.scrollHeight;
   }
@@ -950,16 +963,18 @@ function appendStreamText(text) {
   if (interim) interim.remove();
 
   let i = 0;
-  const interval = setInterval(() => {
+  const typeNextChar = () => {
     if (i >= text.length) {
-      clearInterval(interval);
       if (interim) transcriptText.appendChild(interim);
       return;
     }
     transcriptText.insertAdjacentText('beforeend', text[i]);
     transcriptBox.scrollTop = transcriptBox.scrollHeight;
     i += 1;
-  }, 20);
+    setTimeout(typeNextChar, 20);
+  };
+
+  typeNextChar();
 }
 
 function clearTranscriptUI() {
@@ -973,6 +988,19 @@ function clearProgressUI() {
   currentProgressState = null;
   setProgressCopy('Transcribiendo...', '0/0 clips procesados');
   hideProgressContainer();
+}
+
+async function fetchLiveTranscriptSurface(sessionId) {
+  if (!hasText(sessionId)) {
+    return null;
+  }
+
+  const response = await sendBg('getLiveTranscript', { sessionId });
+  return response && response.ok ? response.liveTranscript : null;
+}
+
+function getTranscriptPollIntervalMs(transcriptSession) {
+  return transcriptSession && transcriptSession.mode === 'live' ? 150 : 300;
 }
 
 // ── Provider settings UI ──
@@ -1132,12 +1160,15 @@ async function init() {
    const transcript = storageState && storageState.transcript;
    if (resolvedState.status === 'idle') {
      clearTranscriptUI();
-   } else if (transcript && (transcript.final || transcript.interim)) {
-     placeholder.style.display = 'none';
-     transcriptText.textContent = transcript.final || '';
-     lastTranscriptLength = (transcript.final || '').length;
-     if (transcript.final || transcript.interim) btnCopy.disabled = false;
-   }
+     } else if (transcript && (transcript.final || transcript.interim)) {
+       placeholder.style.display = 'none';
+       transcriptText.textContent = transcript.final || '';
+       lastTranscriptLength = (transcript.final || '').length;
+       if (transcript.interim) {
+         updateTranscriptUI(transcript.final || '', transcript.interim || '', transcript.mode || 'batch');
+       }
+       if (transcript.final || transcript.interim) btnCopy.disabled = false;
+     }
 
   const audioLanguage = storageState && storageState.audioLanguage;
   if (audioLanguage) {

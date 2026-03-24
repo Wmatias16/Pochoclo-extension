@@ -153,3 +153,21 @@ test('readProviderSettings removes leftover legacy key even when provider settin
   assert.equal(storage.store.providerSettings.providers.openai.apiKey, 'sk-current');
   assert.equal(Object.prototype.hasOwnProperty.call(storage.store, 'openaiApiKey'), false);
 });
+
+test('default provider settings keep Deepgram live disabled until explicitly enabled', () => {
+  const settings = buildDefaultProviderSettings();
+
+  assert.equal(settings.providers.deepgram.liveEnabled, false);
+});
+
+test('normalizeProviderSettings preserves Deepgram live flag and keeps unknown providers on defaults', () => {
+  const result = normalizeProviderSettings({
+    defaultProvider: 'deepgram',
+    providers: {
+      deepgram: { enabled: true, apiKey: 'dg-key', liveEnabled: true }
+    }
+  });
+
+  assert.equal(result.providers.deepgram.liveEnabled, true);
+  assert.equal(result.providers.openai.enabled, true);
+});

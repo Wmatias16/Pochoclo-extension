@@ -32,6 +32,32 @@
     }
   }
 
+  const LIVE_SESSION_COMMANDS = {
+    PROCESS_CHUNK: 'processChunk',
+    START_LIVE_SESSION: 'startLiveSession',
+    LIVE_AUDIO_CHUNK: 'liveAudioChunk',
+    FLUSH_LIVE_SESSION: 'flushLiveSession',
+    STOP_LIVE_SESSION: 'stopLiveSession'
+  };
+
+  async function routeProviderSessionCommand(message = {}, handlers = {}) {
+    const action = message && message.action;
+    const actionHandlers = {
+      [LIVE_SESSION_COMMANDS.PROCESS_CHUNK]: handlers.processChunk,
+      [LIVE_SESSION_COMMANDS.START_LIVE_SESSION]: handlers.startLiveSession,
+      [LIVE_SESSION_COMMANDS.LIVE_AUDIO_CHUNK]: handlers.liveAudioChunk,
+      [LIVE_SESSION_COMMANDS.FLUSH_LIVE_SESSION]: handlers.flushLiveSession,
+      [LIVE_SESSION_COMMANDS.STOP_LIVE_SESSION]: handlers.stopLiveSession
+    };
+    const handler = actionHandlers[action];
+
+    if (typeof handler !== 'function') {
+      return null;
+    }
+
+    return handler(message);
+  }
+
   function upsertAttempt(session, providerId, patch = {}, timestamp) {
     const attempts = cloneAttempts(session);
     const now = typeof timestamp === 'number' ? timestamp : Date.now();
@@ -381,11 +407,13 @@
   }
 
   return {
+    LIVE_SESSION_COMMANDS,
     cloneAttempts,
     ensureActiveAttempt,
     executeChunkWithFallback,
     finalizeSession,
     getNextProviderId,
+    routeProviderSessionCommand,
     upsertAttempt
   };
 });

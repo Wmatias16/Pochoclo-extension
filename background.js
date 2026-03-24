@@ -4,6 +4,7 @@
 if (typeof importScripts === 'function') {
   importScripts(
     'diagnostics/provider-logger.js',
+    'runtime/live-provider-session-runtime.js',
     'runtime/provider-session-runtime.js',
     'runtime/recording-awareness.js',
     'runtime/offscreen-bridge.js',
@@ -14,6 +15,7 @@ if (typeof importScripts === 'function') {
     'providers/adapters/openai.js',
     'runtime/transcription-summarizer.js',
     'providers/adapters/deepgram.js',
+    'providers/live/deepgram-live.js',
     'providers/adapters/assemblyai.js',
     'providers/adapters/groq.js',
     'providers/adapters/google.js',
@@ -61,6 +63,10 @@ function createScopedLogger(context) {
 let saveChain = Promise.resolve();
 let processChunkChain = Promise.resolve();
 const activeSummaryJobs = new Map();
+let liveTranscriptVolatile = {
+  sessionId: null,
+  interim: ''
+};
 
 const SUMMARY_JOB_STORAGE_KEY = 'summaryJobs';
 const TRANSCRIPTION_PROGRESS_STORAGE_KEY = 'transcriptionProgress';
@@ -68,6 +74,8 @@ const SUMMARY_JOB_TTL_MS = 2 * 60 * 1000;
 
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const OPENAI_LIVE_TRANSCRIPTION_CHUNK_MS = 3000;
+const POPUP_BATCH_POLL_MS = 300;
+const POPUP_LIVE_POLL_MS = 150;
 
 const PRODUCT_NAME = 'Pochoclo - Transcriptor';
 /**
@@ -228,12 +236,191 @@ const HALLUCINATIONS = [
   'moscatalworking'
 ];
 
-function saveTranscriptQueued(text) {
+function createTranscriptRecord(record = {}, defaultMode = 'batch') {
+  if (transcriptionStore && typeof transcriptionStore.normalizeTranscription === 'function') {
+    return transcriptionStore.normalizeTranscription(record, defaultMode);
+  }
+
+  const text = typeof record.text === 'string'
+    ? record.text
+    : (typeof record.final === 'string' ? record.final : '');
+  return {
+    text,
+    final: typeof record.final === 'string' ? record.final : text,
+    interim: typeof record.interim === 'string' ? record.interim : '',
+    mode: record && typeof record.mode === 'string' ? record.mode : defaultMode,
+    fallbackReason: null,
+    reconnectCount: 0,
+    terminalStatus: null,
+    providerAttribution: [],
+    liveMeta: {
+      reconnectCount: 0,
+      finalSegments: 0,
+      startedAt: null,
+      endedAt: null
+    }
+  };
+}
+
+function buildProviderAttributionLabel(providerId, mode = 'batch') {
+  if (!hasText(providerId)) {
+    return null;
+  }
+
+  return `${providerId.trim()}-${mode === 'live' ? 'live' : 'batch'}`;
+}
+
+function appendProviderAttribution(existing, providerId, mode = 'batch') {
+  const nextLabel = buildProviderAttributionLabel(providerId, mode);
+  const source = Array.isArray(existing) ? existing.slice() : [];
+  if (nextLabel && !source.includes(nextLabel)) {
+    source.push(nextLabel);
+  }
+  return source;
+}
+
+function deriveLiveFallbackReason(transcriptSession) {
+  if (!transcriptSession || typeof transcriptSession !== 'object') {
+    return null;
+  }
+
+  if (hasText(transcriptSession.fallbackReason)) {
+    return transcriptSession.fallbackReason.trim();
+  }
+
+  if (transcriptSession.live && hasText(transcriptSession.live.fallbackReason)) {
+    return transcriptSession.live.fallbackReason.trim();
+  }
+
+  const liveEvents = Array.isArray(transcriptSession.audit && transcriptSession.audit.liveEvents)
+    ? transcriptSession.audit.liveEvents
+    : [];
+
+  for (let index = liveEvents.length - 1; index >= 0; index -= 1) {
+    const event = liveEvents[index];
+    if (!event || typeof event !== 'object') {
+      continue;
+    }
+
+    if (event.event === 'live:fallback' && hasText(event.payload && event.payload.reason)) {
+      return event.payload.reason.trim();
+    }
+
+    if (event.event === 'live:close' && hasText(event.payload && event.payload.meta && event.payload.meta.fallbackReason)) {
+      return event.payload.meta.fallbackReason.trim();
+    }
+  }
+
+  return null;
+}
+
+function sanitizeLivePayload(payload) {
+  if (providerDiagnostics && typeof providerDiagnostics.sanitizeDiagnosticsContext === 'function') {
+    return providerDiagnostics.sanitizeDiagnosticsContext(payload || {}, 'live');
+  }
+  return payload || {};
+}
+
+async function recordLiveAuditEvent(transcriptSession, eventName, payload = {}, level = 'info') {
+  if (!transcriptSession || !transcriptSession.id) {
+    return null;
+  }
+
+  const sanitizedPayload = sanitizeLivePayload(payload);
+  const eventRecord = {
+    event: eventName,
+    sessionId: transcriptSession.id,
+    timestamp: Number.isFinite(Number(payload.timestamp || payload.at)) ? Number(payload.timestamp || payload.at) : Date.now(),
+    provider: payload.provider || payload.providerId || transcriptSession.activeProvider || null,
+    payload: sanitizedPayload
+  };
+
+  const liveLogger = createScopedLogger({
+    scope: 'live.audit',
+    sessionId: transcriptSession.id,
+    providerId: eventRecord.provider
+  });
+  if (liveLogger && typeof liveLogger.liveEvent === 'function') {
+    liveLogger.liveEvent(eventName, eventRecord);
+  } else if (liveLogger && typeof liveLogger[level] === 'function') {
+    liveLogger[level](eventName, eventRecord);
+  }
+
+  const currentEvents = Array.isArray(transcriptSession.audit && transcriptSession.audit.liveEvents)
+    ? transcriptSession.audit.liveEvents.slice(-49)
+    : [];
+  currentEvents.push(eventRecord);
+
+  return patchTranscriptSession({
+    audit: {
+      ...(transcriptSession.audit || {}),
+      liveEvents: currentEvents
+    }
+  });
+}
+
+async function buildLiveTranscriptSurface(sessionId) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || transcriptSession.id !== sessionId) {
+    return null;
+  }
+
+  const effectiveTranscript = transcriptionStore && typeof transcriptionStore.getLiveTranscript === 'function'
+    ? await transcriptionStore.getLiveTranscript(sessionId, chrome.storage.local)
+    : null;
+
+  return {
+    sessionId,
+    ...(effectiveTranscript || createTranscriptRecord({}, transcriptSession.mode === 'live' ? 'live' : 'batch')),
+    live: transcriptSession.mode === 'live',
+    pollIntervalMs: transcriptSession.mode === 'live' ? POPUP_LIVE_POLL_MS : POPUP_BATCH_POLL_MS
+  };
+}
+
+async function patchStoredTranscript(patch = {}, defaultMode = 'batch') {
+  const { transcript } = await chrome.storage.local.get('transcript');
+  const current = createTranscriptRecord(transcript, defaultMode);
+  const next = createTranscriptRecord({
+    ...current,
+    ...patch,
+    liveMeta: patch.liveMeta
+      ? { ...(current.liveMeta || {}), ...patch.liveMeta }
+      : current.liveMeta
+  }, patch.mode || current.mode || defaultMode);
+  await chrome.storage.local.set({ transcript: next });
+  return next;
+}
+
+function setLiveTranscriptInterim(sessionId, interim) {
+  liveTranscriptVolatile = {
+    sessionId: typeof sessionId === 'string' ? sessionId : null,
+    interim: typeof interim === 'string' ? interim : ''
+  };
+}
+
+function getLiveTranscriptInterim(sessionId) {
+  if (!sessionId || liveTranscriptVolatile.sessionId !== sessionId) {
+    return '';
+  }
+
+  return liveTranscriptVolatile.interim || '';
+}
+
+function clearLiveTranscriptInterim(sessionId) {
+  if (!sessionId || liveTranscriptVolatile.sessionId === sessionId) {
+    setLiveTranscriptInterim(null, '');
+  }
+}
+
+function saveTranscriptQueued(text, options = {}) {
+  const mode = typeof options.mode === 'string' ? options.mode : 'batch';
   saveChain = saveChain.then(() => new Promise((resolve) => {
     chrome.storage.local.get('transcript', ({ transcript }) => {
-      const current = transcript || { final: '', interim: '' };
-      current.final = (current.final || '') + text;
+      const current = createTranscriptRecord(transcript, mode);
+      current.text = (current.text || '') + text;
+      current.final = current.text;
       current.interim = '';
+      current.mode = mode;
       chrome.storage.local.set({ transcript: current }, resolve);
     });
   }));
@@ -733,9 +920,39 @@ async function setTranscriptSession(session) {
   return session;
 }
 
-async function patchTranscriptSession(patch) {
+async function patchTranscriptSession(patchOrUpdater) {
   const current = await getTranscriptSession();
-  const next = { ...(current || {}), ...patch };
+  const patch = typeof patchOrUpdater === 'function'
+    ? await patchOrUpdater(current)
+    : patchOrUpdater;
+
+  if (!patch) {
+    return current;
+  }
+
+  const next = {
+    ...(current || {}),
+    ...patch
+  };
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'audit')) {
+    next.audit = patch.audit
+      ? { ...((current && current.audit) || {}), ...patch.audit }
+      : patch.audit;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'liveMeta')) {
+    next.liveMeta = patch.liveMeta
+      ? { ...((current && current.liveMeta) || {}), ...patch.liveMeta }
+      : patch.liveMeta;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'live')) {
+    next.live = patch.live
+      ? { ...((current && current.live) || {}), ...patch.live }
+      : patch.live;
+  }
+
   await chrome.storage.local.set({ transcriptSession: next });
   return next;
 }
@@ -835,6 +1052,487 @@ async function syncTranscriptionProgress(snapshot = {}) {
 
   const finalized = await maybeFinalizeTranscriptionProgress(merged);
   return { ok: true, progress: finalized };
+}
+
+function appendLiveFinalText(currentFinal, nextText) {
+  const existing = typeof currentFinal === 'string' ? currentFinal : '';
+  const normalized = typeof nextText === 'string' ? nextText.trim() : '';
+  if (!normalized) {
+    return existing;
+  }
+
+  return `${existing}${normalized} `;
+}
+
+function shouldSuppressLateLivePartial(finalizedText, partialText) {
+  const finalized = typeof finalizedText === 'string' ? finalizedText.trim() : '';
+  const partial = typeof partialText === 'string' ? partialText.trim() : '';
+
+  if (!finalized || !partial) {
+    return false;
+  }
+
+  return finalized === partial
+    || finalized.endsWith(partial)
+    || finalized.includes(partial);
+}
+
+async function applyLiveTranscriptEvent(message = {}) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || !message.sessionId || transcriptSession.id !== message.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  const { transcript } = await chrome.storage.local.get('transcript');
+  const nextTranscript = createTranscriptRecord(transcript, transcriptSession.mode === 'live' ? 'live' : 'batch');
+  nextTranscript.interim = getLiveTranscriptInterim(message.sessionId);
+
+  if (message.action === 'livePartial') {
+    if (transcriptSession.mode === 'batch') {
+      return { ok: true, ignored: true, reason: 'batch-fallback-active' };
+    }
+
+    const partialText = typeof message.text === 'string' ? message.text : '';
+    if (shouldSuppressLateLivePartial(nextTranscript.text, partialText)) {
+      return {
+        ok: true,
+        suppressed: true,
+        transcript: nextTranscript,
+        reason: 'late-partial-after-final'
+      };
+    }
+
+    setLiveTranscriptInterim(message.sessionId, partialText);
+    nextTranscript.interim = partialText;
+    nextTranscript.mode = 'live';
+    const attributedProviders = appendProviderAttribution(
+      nextTranscript.providerAttribution,
+      message.providerId,
+      'live'
+    );
+    const updatedSession = await patchTranscriptSession({
+      providerAttribution: attributedProviders,
+      reconnectCount: transcriptSession.reconnectCount || 0,
+      terminalStatus: 'streaming',
+      liveMeta: {
+        ...(transcriptSession.liveMeta || {}),
+        reconnectCount: transcriptSession.reconnectCount || 0,
+        finalSegments: transcriptSession.liveMeta && Number.isFinite(Number(transcriptSession.liveMeta.finalSegments))
+          ? Number(transcriptSession.liveMeta.finalSegments)
+          : 0,
+        startedAt: transcriptSession.startedAt || Date.now(),
+        endedAt: null
+      },
+      live: {
+        ...(transcriptSession.live || {}),
+        partialText,
+        lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+      }
+    });
+    await patchStoredTranscript({
+      text: nextTranscript.text,
+      final: nextTranscript.final,
+      interim: partialText,
+      mode: 'live',
+      fallbackReason: null,
+      reconnectCount: updatedSession.reconnectCount || 0,
+      terminalStatus: updatedSession.terminalStatus,
+      providerAttribution: attributedProviders,
+      liveMeta: updatedSession.liveMeta
+    }, 'live');
+    await recordLiveAuditEvent(transcriptSession, 'live:partial', {
+      at: message.at,
+      providerId: message.providerId,
+      text: partialText,
+      meta: message.meta || null
+    });
+    return {
+      ok: true,
+      transcript: {
+        ...nextTranscript,
+        providerAttribution: attributedProviders
+      },
+      transcriptSession: updatedSession,
+      liveTranscript: await buildLiveTranscriptSurface(message.sessionId)
+    };
+  }
+
+  if (message.action === 'liveFinal') {
+    nextTranscript.text = appendLiveFinalText(nextTranscript.text, message.text);
+    nextTranscript.final = nextTranscript.text;
+    nextTranscript.interim = '';
+    nextTranscript.mode = transcriptSession.mode === 'batch' ? 'batch' : 'live';
+    clearLiveTranscriptInterim(message.sessionId);
+    nextTranscript.providerAttribution = appendProviderAttribution(
+      nextTranscript.providerAttribution,
+      message.providerId,
+      transcriptSession.mode === 'batch' ? 'batch' : 'live'
+    );
+    nextTranscript.liveMeta = {
+      ...(nextTranscript.liveMeta || {}),
+      reconnectCount: transcriptSession.reconnectCount || 0,
+      finalSegments: ((transcriptSession.liveMeta && transcriptSession.liveMeta.finalSegments) || 0) + 1,
+      startedAt: transcriptSession.startedAt || Date.now(),
+      endedAt: null
+    };
+    const updatedSession = await patchTranscriptSession({
+      providerAttribution: nextTranscript.providerAttribution,
+      reconnectCount: transcriptSession.reconnectCount || 0,
+      terminalStatus: transcriptSession.mode === 'batch' ? 'fallback-to-batch' : 'streaming',
+      liveMeta: nextTranscript.liveMeta,
+      live: {
+        ...(transcriptSession.live || {}),
+        partialText: '',
+        finalText: nextTranscript.text,
+        lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+      }
+    });
+    await patchStoredTranscript({
+      ...nextTranscript,
+      reconnectCount: updatedSession.reconnectCount || 0,
+      terminalStatus: updatedSession.terminalStatus,
+      providerAttribution: nextTranscript.providerAttribution,
+      liveMeta: updatedSession.liveMeta
+    }, nextTranscript.mode);
+    await recordLiveAuditEvent(transcriptSession, 'live:final', {
+      at: message.at,
+      providerId: message.providerId,
+      text: message.text,
+      meta: message.meta || null
+    });
+    return {
+      ok: true,
+      transcript: nextTranscript,
+      transcriptSession: updatedSession,
+      liveTranscript: await buildLiveTranscriptSurface(message.sessionId)
+    };
+  }
+
+  return { ok: true, ignored: true };
+}
+
+async function handleLiveError(message = {}) {
+  const liveLogger = createScopedLogger({
+    scope: 'live.error',
+    sessionId: message.sessionId || null
+  });
+  const transcriptSession = await getTranscriptSession();
+
+  if (typeof liveLogger.warn === 'function') {
+    liveLogger.warn('live.session-error', {
+      sessionId: message.sessionId || null,
+      providerId: message.providerId || null,
+      code: message.code || null,
+      retryable: !!message.retryable,
+      message: message.message || null,
+      reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0
+    });
+  }
+
+  if (transcriptSession && transcriptSession.id === message.sessionId) {
+    const updatedSession = await patchTranscriptSession({
+      reconnectCount: Number.isFinite(Number(message.reconnects))
+        ? Number(message.reconnects)
+        : (transcriptSession.reconnectCount || 0),
+      terminalStatus: message.retryable ? 'streaming' : 'error',
+      liveMeta: {
+        ...(transcriptSession.liveMeta || {}),
+        reconnectCount: Number.isFinite(Number(message.reconnects))
+          ? Number(message.reconnects)
+          : (transcriptSession.reconnectCount || 0),
+        startedAt: transcriptSession.startedAt || Date.now(),
+        endedAt: message.retryable ? null : Date.now()
+      }
+    });
+    await patchStoredTranscript({
+      mode: transcriptSession.mode === 'live' ? 'live' : 'batch',
+      fallbackReason: transcriptSession.fallbackReason || null,
+      reconnectCount: updatedSession.reconnectCount || 0,
+      terminalStatus: updatedSession.terminalStatus,
+      providerAttribution: updatedSession.providerAttribution || transcriptSession.providerAttribution || [],
+      liveMeta: updatedSession.liveMeta
+    }, transcriptSession.mode === 'live' ? 'live' : 'batch');
+    await recordLiveAuditEvent(transcriptSession, 'live:error', {
+      at: message.at,
+      providerId: message.providerId,
+      code: message.code,
+      message: message.message,
+      retryable: message.retryable,
+      reconnects: message.reconnects
+    }, 'warn');
+  }
+
+  return { ok: true };
+}
+
+async function handleLiveConnect(message = {}) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || transcriptSession.id !== message.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  const updatedSession = await patchTranscriptSession({
+    reconnectCount: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : (transcriptSession.reconnectCount || 0),
+    terminalStatus: 'streaming',
+    providerAttribution: appendProviderAttribution(transcriptSession.providerAttribution, message.providerId, 'live'),
+    liveMeta: {
+      ...(transcriptSession.liveMeta || {}),
+      reconnectCount: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : (transcriptSession.reconnectCount || 0),
+      startedAt: transcriptSession.startedAt || Date.now(),
+      endedAt: null
+    },
+    live: {
+      ...(transcriptSession.live || {}),
+      status: 'streaming',
+      lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+    }
+  });
+  await patchStoredTranscript({
+    mode: 'live',
+    reconnectCount: updatedSession.reconnectCount || 0,
+    terminalStatus: updatedSession.terminalStatus,
+    providerAttribution: updatedSession.providerAttribution || [],
+    liveMeta: updatedSession.liveMeta
+  }, 'live');
+
+  await recordLiveAuditEvent(transcriptSession, 'live:connect', {
+    at: message.at,
+    providerId: message.providerId,
+    reconnects: message.reconnects,
+    meta: message.meta || null
+  });
+
+  return { ok: true, transcriptSession: updatedSession };
+}
+
+async function handleLiveReconnect(message = {}) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || transcriptSession.id !== message.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  const reconnectCount = Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : (transcriptSession.reconnectCount || 0);
+  const updatedSession = await patchTranscriptSession({
+    reconnectCount,
+    terminalStatus: 'streaming',
+    liveMeta: {
+      ...(transcriptSession.liveMeta || {}),
+      reconnectCount,
+      startedAt: transcriptSession.startedAt || Date.now(),
+      endedAt: null
+    },
+    live: {
+      ...(transcriptSession.live || {}),
+      status: 'reconnecting',
+      reconnects: reconnectCount,
+      lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+    }
+  });
+  await patchStoredTranscript({
+    mode: 'live',
+    reconnectCount,
+    terminalStatus: updatedSession.terminalStatus,
+    providerAttribution: updatedSession.providerAttribution || transcriptSession.providerAttribution || [],
+    liveMeta: updatedSession.liveMeta
+  }, 'live');
+
+  await recordLiveAuditEvent(transcriptSession, 'live:reconnect', {
+    at: message.at,
+    providerId: message.providerId,
+    reconnects: reconnectCount,
+    meta: message.meta || null
+  }, 'warn');
+
+  return { ok: true, transcriptSession: updatedSession };
+}
+
+async function handleLiveClose(message = {}) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || transcriptSession.id !== message.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  const { transcript } = await chrome.storage.local.get('transcript');
+  const storedTranscript = createTranscriptRecord(transcript, transcriptSession.mode === 'live' ? 'live' : 'batch');
+  const closeFallbackReason = hasText(message.reason)
+    ? message.reason
+    : (message.meta && hasText(message.meta.fallbackReason) ? message.meta.fallbackReason : null);
+
+  const isFallbackSession = (
+    (transcriptSession.mode === 'batch' && hasText(transcriptSession.fallbackReason))
+    || (transcriptSession.live && transcriptSession.live.status === 'fallback')
+    || transcriptSession.terminalStatus === 'fallback-to-batch'
+    || (storedTranscript.mode === 'batch' && hasText(storedTranscript.fallbackReason))
+    || storedTranscript.terminalStatus === 'fallback-to-batch'
+    || !!closeFallbackReason
+    || (message.meta && message.meta.status === 'error')
+  );
+
+  const updatedSession = await patchTranscriptSession((currentSession) => {
+    const activeSession = currentSession && currentSession.id === message.sessionId
+      ? currentSession
+      : transcriptSession;
+    const activeStoredTranscript = createTranscriptRecord(
+      transcript,
+      activeSession && activeSession.mode === 'live' ? 'live' : 'batch'
+    );
+
+    const fallbackSession = (
+      (activeSession.mode === 'batch' && hasText(activeSession.fallbackReason))
+      || (activeSession.live && activeSession.live.status === 'fallback')
+      || activeSession.terminalStatus === 'fallback-to-batch'
+      || (activeStoredTranscript.mode === 'batch' && hasText(activeStoredTranscript.fallbackReason))
+      || activeStoredTranscript.terminalStatus === 'fallback-to-batch'
+    );
+
+    return {
+      mode: fallbackSession ? 'batch' : (activeSession.mode === 'batch' ? 'batch' : 'live'),
+      fallbackReason: fallbackSession
+        ? (activeSession.fallbackReason || activeStoredTranscript.fallbackReason || closeFallbackReason || 'reconnect_exhausted')
+        : (activeSession.fallbackReason || null),
+      terminalStatus: fallbackSession ? 'fallback-to-batch' : 'completed',
+      liveMeta: {
+        ...(activeSession.liveMeta || {}),
+        endedAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+      },
+      live: {
+        ...(activeSession.live || {}),
+        status: fallbackSession ? 'fallback' : 'closed',
+        fallbackReason: fallbackSession
+          ? (activeSession.live && activeSession.live.fallbackReason)
+            || activeSession.fallbackReason
+            || activeStoredTranscript.fallbackReason
+            || closeFallbackReason
+            || 'reconnect_exhausted'
+          : ((activeSession.live && activeSession.live.fallbackReason) || null),
+        lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+      }
+    };
+  });
+  const nextMode = updatedSession.mode === 'batch' ? 'batch' : 'live';
+  await patchStoredTranscript({
+    mode: nextMode,
+    interim: '',
+    fallbackReason: updatedSession.fallbackReason || null,
+    reconnectCount: updatedSession.reconnectCount || transcriptSession.reconnectCount || 0,
+    terminalStatus: updatedSession.terminalStatus,
+    providerAttribution: updatedSession.providerAttribution || transcriptSession.providerAttribution || [],
+    liveMeta: updatedSession.liveMeta
+  }, nextMode);
+
+  await recordLiveAuditEvent(transcriptSession, 'live:close', {
+    at: message.at,
+    providerId: message.providerId,
+    meta: message.meta || null
+  });
+
+  return { ok: true, transcriptSession: updatedSession };
+}
+
+async function handleLiveFallback(message = {}) {
+  const transcriptSession = await getTranscriptSession();
+  if (!transcriptSession || !message.sessionId || transcriptSession.id !== message.sessionId) {
+    return { ok: true, ignored: true, reason: 'stale-session' };
+  }
+
+  const fallbackLogger = createScopedLogger({
+    scope: 'live.fallback',
+    sessionId: message.sessionId || null
+  });
+
+  const { transcript } = await chrome.storage.local.get('transcript');
+  const nextTranscript = createTranscriptRecord(transcript, 'batch');
+  nextTranscript.mode = 'batch';
+  nextTranscript.interim = '';
+  nextTranscript.fallbackReason = message.reason || 'reconnect_exhausted';
+  nextTranscript.reconnectCount = Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0;
+  nextTranscript.terminalStatus = 'fallback-to-batch';
+  nextTranscript.providerAttribution = appendProviderAttribution(
+    appendProviderAttribution(nextTranscript.providerAttribution, message.providerId, 'live'),
+    message.providerId,
+    'batch'
+  );
+  nextTranscript.liveMeta = {
+    ...(nextTranscript.liveMeta || {}),
+    reconnectCount: nextTranscript.reconnectCount,
+    startedAt: transcriptSession.startedAt || Date.now(),
+    endedAt: Date.now()
+  };
+
+  const updatedSession = await patchTranscriptSession({
+    mode: 'batch',
+    fallbackReason: message.reason || 'reconnect_exhausted',
+    reconnectCount: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+    terminalStatus: 'fallback-to-batch',
+    providerAttribution: nextTranscript.providerAttribution,
+    liveMeta: nextTranscript.liveMeta,
+      live: {
+        ...(transcriptSession.live || {}),
+        status: 'fallback',
+      fallbackReason: message.reason || 'reconnect_exhausted',
+      reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+      lastEventAt: Number.isFinite(Number(message.at)) ? Number(message.at) : Date.now()
+      }
+  });
+
+  clearLiveTranscriptInterim(message.sessionId);
+  await patchStoredTranscript(nextTranscript, 'batch');
+
+  await recordLiveAuditEvent(transcriptSession, 'live:fallback', {
+    at: message.at,
+    providerId: message.providerId,
+    reason: message.reason || 'reconnect_exhausted',
+    reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+    error: message.error || null
+  }, 'warn');
+
+  const sessionContext = {
+    sessionId: transcriptSession.id,
+    language: transcriptSession.language || 'es',
+    activeProvider: updatedSession.activeProvider || transcriptSession.activeProvider || message.providerId || null,
+    chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+
+  const promoteMessage = offscreenBridge && typeof offscreenBridge.buildPromoteBatchFallbackMessage === 'function'
+    ? offscreenBridge.buildPromoteBatchFallbackMessage({ sessionId: transcriptSession.id }, {
+        reason: message.reason || 'reconnect_exhausted',
+        reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+        sessionContext
+      })
+    : {
+        target: 'offscreen',
+        action: 'promoteBatchFallback',
+        sessionId: transcriptSession.id,
+        reason: message.reason || 'reconnect_exhausted',
+        reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+        sessionContext
+      };
+
+  let promoteResult = null;
+  try {
+    promoteResult = await chrome.runtime.sendMessage(promoteMessage);
+  } catch (error) {
+    promoteResult = { ok: false, error: error.message };
+  }
+
+  if (typeof fallbackLogger.warn === 'function') {
+    fallbackLogger.warn('live.session-fallback', {
+      sessionId: message.sessionId || null,
+      providerId: message.providerId || null,
+      reason: message.reason || 'reconnect_exhausted',
+      reconnects: Number.isFinite(Number(message.reconnects)) ? Number(message.reconnects) : 0,
+      promoteOk: !promoteResult || promoteResult.ok !== false
+    });
+  }
+
+  return {
+    ok: true,
+    fallbackQueued: true,
+    reason: message.reason || 'reconnect_exhausted',
+    transcriptSession: updatedSession,
+    promoteResult,
+    liveTranscript: await buildLiveTranscriptSurface(message.sessionId)
+  };
 }
 
 async function readProviderSettings() {
@@ -1285,7 +1983,10 @@ async function stopRecordingAndCleanup(reason = 'user-stop', options = {}) {
   await reconcileRecordingAwareness(idleState, { now: options.now });
 
   try {
-    await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
+    const stopMessage = transcriptSession && transcriptSession.mode === 'live'
+      ? offscreenBridge.buildStopLiveSessionMessage({ sessionId: transcriptSession.id }, { reason })
+      : { target: 'offscreen', action: 'stop' };
+    await chrome.runtime.sendMessage(stopMessage);
   } catch (e) {
     // Offscreen may already be gone — that's fine
   }
@@ -1298,11 +1999,26 @@ async function stopRecordingAndCleanup(reason = 'user-stop', options = {}) {
       endedAt: Date.now(),
       stopReason: reason
     });
+    finalizedSession.terminalStatus = finalizedSession.mode === 'batch' && finalizedSession.fallbackReason
+      ? 'fallback-to-batch'
+      : (reason === 'error' ? 'error' : 'completed');
+    finalizedSession.liveMeta = {
+      ...(finalizedSession.liveMeta || {}),
+      endedAt: Date.now()
+    };
     await setTranscriptSession(finalizedSession);
   }
 
   if (prevState.status !== 'idle') {
     await autoSaveTranscript(prevState, finalizedSession);
+  }
+
+  if (finalizedSession && finalizedSession.mode === 'live') {
+    await recordLiveAuditEvent(finalizedSession, 'live:close', {
+      at: Date.now(),
+      providerId: finalizedSession.activeProvider,
+      reason
+    });
   }
 
   if (reason === 'inactive') {
@@ -1475,6 +2191,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       getTranscriptSession().then(session => sendResponse({ ok: true, transcriptSession: session }));
       return true;
 
+    case 'getLiveTranscript':
+      buildLiveTranscriptSurface(msg.sessionId).then((liveTranscript) => sendResponse({ ok: true, liveTranscript })).catch((e) => sendResponse({ ok: false, error: e.message }));
+      return true;
+
     case 'saveTranscript':
       saveTranscriptQueued(msg.text).then(() => sendResponse({ ok: true }));
       return true;
@@ -1493,6 +2213,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'syncTranscriptionProgress':
       syncTranscriptionProgress(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'livePartial':
+      applyLiveTranscriptEvent(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveConnect':
+      handleLiveConnect(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveFinal':
+      applyLiveTranscriptEvent(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveError':
+      handleLiveError(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveFallback':
+      handleLiveFallback(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveReconnect':
+      handleLiveReconnect(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
+      return true;
+
+    case 'liveClose':
+      handleLiveClose(msg).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message }));
       return true;
 
     case 'getTranscriptions':
@@ -1573,9 +2321,17 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
   const providerSettings = await readProviderSettings();
   const { audioLanguage } = await chrome.storage.local.get('audioLanguage');
   const startLogger = createScopedLogger({ scope: 'session.start', tabId });
+  const requestedProviderId = providerOverride || providerSettings.defaultProvider;
+  const requestedProviderConfig = providerSettings.providers && requestedProviderId
+    ? providerSettings.providers[requestedProviderId]
+    : null;
+  const requestedLiveMode = requestedProviderId === 'deepgram'
+    && requestedProviderConfig
+    && requestedProviderConfig.liveEnabled === true;
   const transcriptionSession = await providerRegistry.createTranscriptionSession({
     providerSettings,
     providerOverride,
+    mode: requestedLiveMode ? 'live' : undefined,
     language: audioLanguage || 'es',
     targetLanguage: 'es'
   }, {
@@ -1602,23 +2358,65 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
   await setTranscriptSession({
     ...transcriptionSession,
     status: 'starting',
+    reconnectCount: 0,
+    fallbackReason: null,
+    terminalStatus: transcriptionSession.mode === 'live' ? 'streaming' : 'completed',
+    providerAttribution: appendProviderAttribution([], transcriptionSession.activeProvider, transcriptionSession.mode),
+    liveMeta: transcriptionSession.mode === 'live'
+      ? {
+          reconnectCount: 0,
+          finalSegments: 0,
+          startedAt: Date.now(),
+          endedAt: null
+        }
+      : {
+          reconnectCount: 0,
+          finalSegments: 0,
+          startedAt: null,
+          endedAt: null
+        },
+    live: transcriptionSession.mode === 'live'
+      ? {
+          status: 'starting',
+          partialText: '',
+          finalText: '',
+          lastEventAt: null,
+          reconnects: 0,
+          fallbackReason: null
+        }
+      : null,
+    audit: {
+      ...(transcriptionSession.audit || {}),
+      liveEvents: []
+    },
     tabId,
     tabTitle: tabTitle || '',
     tabUrl: tabUrl || ''
   });
 
+  const sessionContext = {
+    sessionId: transcriptionSession.id,
+    language: transcriptionSession.language || 'es',
+    activeProvider: transcriptionSession.activeProvider || null,
+    chunkIntervalMs: getLiveTranscriptionChunkMs(transcriptionSession.activeProvider)
+  };
+
   // Tell offscreen to start recording with this stream ID
-  const resp = await chrome.runtime.sendMessage({
-    target: 'offscreen',
-    action: 'start',
-    streamId,
-    sessionContext: {
-      sessionId: transcriptionSession.id,
-      language: transcriptionSession.language || 'es',
-      activeProvider: transcriptionSession.activeProvider || null,
-      chunkIntervalMs: getLiveTranscriptionChunkMs(transcriptionSession.activeProvider)
-    }
-  });
+  const resp = transcriptionSession.mode === 'live'
+    ? await chrome.runtime.sendMessage(offscreenBridge.buildStartLiveSessionMessage({
+        streamId,
+        sessionId: transcriptionSession.id,
+        providerId: transcriptionSession.activeProvider,
+        providerConfig: providerSettings.providers[transcriptionSession.activeProvider] || {},
+        audioFormat: 'audio/webm;codecs=opus',
+        sessionContext
+      }))
+    : await chrome.runtime.sendMessage({
+        target: 'offscreen',
+        action: 'start',
+        streamId,
+        sessionContext
+      });
 
   if (!resp.ok) throw new Error(resp.error);
 
@@ -1630,13 +2428,70 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
     updatedAt: Date.now()
   });
 
-  // Clear previous transcript for fresh start
-  await chrome.storage.local.remove('transcript');
+  const currentSession = await getTranscriptSession();
+  const startupFallbackActive = !!(
+    currentSession
+    && currentSession.id === transcriptionSession.id
+    && (
+      (currentSession.mode === 'batch' && hasText(currentSession.fallbackReason))
+      || (currentSession.live && currentSession.live.status === 'fallback')
+      || currentSession.terminalStatus === 'fallback-to-batch'
+    )
+  );
 
-  await patchTranscriptSession({
-    status: 'recording',
-    startedAt: Date.now()
+  // Clear previous transcript for fresh start only when startup didn't already degrade
+  // to batch and persist transcript continuity during live fallback bootstrap.
+  if (!startupFallbackActive) {
+    await chrome.storage.local.remove('transcript');
+  }
+
+  await patchTranscriptSession((session) => {
+    if (!session || session.id !== transcriptionSession.id) {
+      return null;
+    }
+
+    return {
+      status: 'recording',
+      startedAt: session.startedAt || Date.now()
+    };
   });
+
+  let activeSession = await getTranscriptSession();
+  const activeFallbackReason = deriveLiveFallbackReason(activeSession);
+  if (activeSession && activeFallbackReason) {
+    activeSession = await patchTranscriptSession({
+      mode: 'batch',
+      fallbackReason: activeFallbackReason,
+      terminalStatus: 'fallback-to-batch',
+      live: {
+        ...(activeSession.live || {}),
+        status: 'fallback',
+        fallbackReason: activeFallbackReason
+      }
+    });
+    await patchStoredTranscript({
+      mode: 'batch',
+      fallbackReason: activeFallbackReason,
+      terminalStatus: 'fallback-to-batch',
+      reconnectCount: activeSession.reconnectCount || 0,
+      providerAttribution: activeSession.providerAttribution || [],
+      liveMeta: activeSession.liveMeta
+    }, 'batch');
+  }
+
+  if (
+    activeSession
+    && activeSession.mode === 'live'
+    && !(activeSession.live && activeSession.live.status === 'fallback')
+    && activeSession.terminalStatus !== 'fallback-to-batch'
+  ) {
+    await recordLiveAuditEvent(activeSession, 'live:connect', {
+      at: Date.now(),
+      providerId: activeSession.activeProvider,
+      provider: activeSession.activeProvider,
+      mode: activeSession.mode
+    });
+  }
 
   const awarenessStartedAt = Date.now();
   await persistAndReconcileState({
@@ -1670,7 +2525,9 @@ async function handleStart(tabId, tabTitle, tabUrl, providerOverride) {
     transcriptSession: {
       id: transcriptionSession.id,
       activeProvider: transcriptionSession.activeProvider,
-      providerPlan: transcriptionSession.providerPlan
+      providerPlan: transcriptionSession.providerPlan,
+      mode: transcriptionSession.mode,
+      pollIntervalMs: transcriptionSession.mode === 'live' ? POPUP_LIVE_POLL_MS : POPUP_BATCH_POLL_MS
     }
   };
 }
@@ -1936,10 +2793,24 @@ async function autoSaveTranscript(prevState, transcriptSession) {
   await saveTranscription({
     title: prevState.tabTitle || 'Transcripción sin título',
     text: transcriptText,
+    final: transcript && typeof transcript.final === 'string' ? transcript.final : transcriptText,
+    interim: '',
     url: prevState.tabUrl || '',
     date: Date.now(),
     duration: Math.max(0, Math.floor(duration)),
     language: audioLanguage || 'es',
+    mode: transcriptSession && transcriptSession.mode ? transcriptSession.mode : ((transcript && transcript.mode) || 'batch'),
+    fallbackReason: transcriptSession && transcriptSession.fallbackReason ? transcriptSession.fallbackReason : null,
+    reconnectCount: transcriptSession && Number.isFinite(Number(transcriptSession.reconnectCount))
+      ? Number(transcriptSession.reconnectCount)
+      : (transcript && Number.isFinite(Number(transcript.reconnectCount)) ? Number(transcript.reconnectCount) : 0),
+    terminalStatus: transcriptSession && transcriptSession.terminalStatus ? transcriptSession.terminalStatus : 'completed',
+    providerAttribution: transcriptSession && Array.isArray(transcriptSession.providerAttribution)
+      ? transcriptSession.providerAttribution.slice()
+      : (transcript && Array.isArray(transcript.providerAttribution) ? transcript.providerAttribution.slice() : []),
+    liveMeta: transcriptSession && transcriptSession.liveMeta
+      ? { ...transcriptSession.liveMeta, endedAt: Date.now() }
+      : (transcript && transcript.liveMeta ? { ...transcript.liveMeta, endedAt: Date.now() } : null),
     resolvedProvider: (providerAudit && providerAudit.resolvedProvider) || 'openai',
     status: (providerAudit && providerAudit.status) || 'completed',
     providerAudit
@@ -1950,10 +2821,19 @@ async function autoSaveTranscript(prevState, transcriptSession) {
 async function saveTranscription(entry) {
   const { savedTranscriptions } = await chrome.storage.local.get('savedTranscriptions');
   const list = savedTranscriptions || [];
-  const nextEntry = {
+  const nextEntry = createTranscriptRecord({
     id: 'tx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
     ...entry
-  };
+  }, entry && entry.mode === 'live' ? 'live' : 'batch');
+  nextEntry.id = nextEntry.id || ('tx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
+  nextEntry.title = entry.title;
+  nextEntry.url = entry.url;
+  nextEntry.date = entry.date;
+  nextEntry.duration = entry.duration;
+  nextEntry.language = entry.language;
+  nextEntry.resolvedProvider = entry.resolvedProvider;
+  nextEntry.status = entry.status;
+  nextEntry.providerAudit = entry.providerAudit;
   list.unshift(
     transcriptionStore && typeof transcriptionStore.normalizeSavedTranscription === 'function'
       ? transcriptionStore.normalizeSavedTranscription(nextEntry)
@@ -1991,7 +2871,10 @@ async function updateTranscription(id, updates) {
   const idx = list.findIndex(t => t.id === id);
   if (idx !== -1) {
     if (updates.title !== undefined) list[idx].title = updates.title;
-    if (updates.text !== undefined) list[idx].text = updates.text;
+    if (updates.text !== undefined) {
+      list[idx].text = updates.text;
+      list[idx].final = updates.text;
+    }
     await chrome.storage.local.set({ savedTranscriptions: list });
   }
   return { ok: true };
@@ -2009,10 +2892,17 @@ function downloadAudio(dataUrl) {
 
 if (typeof module === 'object' && module.exports) {
   module.exports = {
+    appendLiveFinalText,
+    applyLiveTranscriptEvent,
     buildRecordingAwarenessDefaults,
     buildRecordingInactivityAlarmName,
     buildRecordingReminderAlarmName,
     calculateRecordingInactivityDeadline,
+    handleLiveError,
+    handleLiveConnect,
+    handleLiveFallback,
+    handleLiveClose,
+    handleLiveReconnect,
     handleInactivityAlarm,
     getTranscriptionProgress,
     handleProcessChunk,

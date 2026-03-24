@@ -30,6 +30,10 @@
     return baseUrl.trim().replace(/\/+$/, '');
   }
 
+  function normalizeMode(mode) {
+    return mode === 'live' ? 'live' : 'batch';
+  }
+
   async function whisperLocalPreflight(config, deps = {}) {
     const fetchImpl = deps.fetchImpl || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
     if (typeof fetchImpl !== 'function') {
@@ -63,6 +67,11 @@
     openai: {
       id: 'openai',
       label: 'OpenAI',
+      liveNative: false,
+      liveAudioFormat: null,
+      // Future OpenAI Realtime rollout will flip this to `pcm16` with a transcoder path.
+      requiresPCM: false,
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.apiKey);
       }
@@ -70,6 +79,11 @@
     deepgram: {
       id: 'deepgram',
       label: 'Deepgram',
+      liveNative: true,
+      // Deepgram live stays on direct MediaRecorder WebM/Opus; no PCM transcoding.
+      liveAudioFormat: 'webm/opus',
+      requiresPCM: false,
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.apiKey);
       }
@@ -77,6 +91,12 @@
     assemblyai: {
       id: 'assemblyai',
       label: 'AssemblyAI',
+      liveNative: false,
+      liveAudioFormat: null,
+      // Future AssemblyAI rollout will flip this to `pcm16` with a transcoder path.
+      requiresPCM: false,
+      // TODO: Phase future — PCM transcoding for AssemblyAI/OpenAI Realtime.
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.apiKey);
       }
@@ -84,6 +104,10 @@
     groq: {
       id: 'groq',
       label: 'Groq',
+      liveNative: false,
+      liveAudioFormat: null,
+      requiresPCM: false,
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.apiKey);
       }
@@ -91,6 +115,10 @@
     google: {
       id: 'google',
       label: 'Google',
+      liveNative: false,
+      liveAudioFormat: null,
+      requiresPCM: false,
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.apiKey);
       }
@@ -98,6 +126,10 @@
     whisperLocal: {
       id: 'whisperLocal',
       label: 'Whisper local',
+      liveNative: false,
+      liveAudioFormat: null,
+      requiresPCM: false,
+      supportsBatchFallback: true,
       isConfigured(config) {
         return hasText(config.baseUrl);
       },
@@ -137,6 +169,25 @@
         reason: 'disabled'
       });
       return { providerId, eligible: false, reason: 'disabled' };
+    }
+
+    const requestedMode = normalizeMode(deps.mode);
+    if (requestedMode === 'live') {
+      if (!definition.liveNative) {
+        logEvent(logger, 'info', 'provider.eligibility-skipped', {
+          providerId,
+          reason: 'live_not_supported'
+        });
+        return { providerId, eligible: false, reason: 'live_not_supported' };
+      }
+
+      if (config.liveEnabled !== true) {
+        logEvent(logger, 'info', 'provider.eligibility-skipped', {
+          providerId,
+          reason: 'live_disabled'
+        });
+        return { providerId, eligible: false, reason: 'live_disabled' };
+      }
     }
 
     if (!definition.isConfigured(config, providerSettings)) {
@@ -202,6 +253,7 @@
     const providerSettings = input.providerSettings || {};
     const overrideProvider = normalizeProviderId(input.providerOverride);
     const defaultProvider = normalizeProviderId(providerSettings.defaultProvider) || 'openai';
+    const mode = normalizeMode(input.mode);
     const logger = deps.logger;
     const candidateOrder = buildCandidateOrder({
       overrideProvider,
@@ -209,7 +261,10 @@
     });
 
     const eligibilityResults = await Promise.all(
-      candidateOrder.map(async (providerId) => [providerId, await getProviderEligibility(providerId, providerSettings, deps)])
+      candidateOrder.map(async (providerId) => [providerId, await getProviderEligibility(providerId, providerSettings, {
+        ...deps,
+        mode
+      })])
     );
 
     const eligibilityMap = Object.fromEntries(eligibilityResults);
@@ -239,6 +294,7 @@
     logEvent(logger, 'info', 'provider.plan-resolved', {
       overrideProvider,
       defaultProvider,
+      mode,
       candidateOrder,
       eligibleProviders,
       skippedProviders,
@@ -249,6 +305,7 @@
     return {
       overrideProvider,
       defaultProvider,
+      mode,
       candidateOrder,
       eligibleProviders,
       skippedProviders,
@@ -265,7 +322,8 @@
     const resolution = await resolveProviderPlan(
       {
         providerSettings,
-        providerOverride: input.providerOverride
+        providerOverride: input.providerOverride,
+        mode: input.mode
       },
       deps
     );
@@ -289,6 +347,7 @@
       id: `txs_${now}_${Math.random().toString(36).slice(2, 8)}`,
       providerOverride: resolution.overrideProvider,
       defaultProvider: resolution.defaultProvider,
+      mode: resolution.mode,
       providerPlan: resolution.plan,
       activeProvider: resolution.activeProvider,
       attempts: [],
@@ -299,7 +358,8 @@
       createdAt: now,
       audit: {
         eligibleProviders: resolution.eligibleProviders,
-        skippedProviders: resolution.skippedProviders
+        skippedProviders: resolution.skippedProviders,
+        mode: resolution.mode
       }
     };
 
@@ -324,6 +384,7 @@
     getProviderEligibility,
     listProviders,
     normalizeProviderId,
+    normalizeMode,
     resolveProviderPlan,
     whisperLocalPreflight
   };

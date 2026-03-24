@@ -4,6 +4,7 @@ const path = require('node:path');
 
 const chunkProcessor = require('../runtime/chunk-processor.js');
 const offscreenBridge = require('../runtime/offscreen-bridge.js');
+const liveProviderSessionRuntime = require('../runtime/live-provider-session-runtime.js');
 
 const OFFSCREEN_PATH = path.resolve(__dirname, '..', 'offscreen.js');
 const LARGE_CHUNK_BODY = 'audio-payload-'.repeat(16);
@@ -680,6 +681,402 @@ test('offscreen syncs accepted chunk totals and keeps draining progress visible 
     const stopped = await stopPromise;
     assert.deepEqual(stopped, { ok: true });
     assert.equal(processChunkCalls >= 2, true);
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Object.entries(originals).forEach(([key, value]) => {
+      setGlobalValue(key, value);
+    });
+  }
+});
+
+test('offscreen starts and stops live capture with MediaRecorder streaming blobs into the live runtime', async () => {
+  const sentMessages = [];
+  const pushCalls = [];
+  let flushCalls = 0;
+  let stopCalls = 0;
+
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => ({ ok: true })
+  });
+  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+  chrome.runtime.sendMessage = (message, callback) => {
+    sentMessages.push(message);
+    return originalSendMessage(message, callback);
+  };
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
+    PochoclaLiveProviderSessionRuntime: global.PochoclaLiveProviderSessionRuntime,
+    PochoclaDeepgramLiveTransport: global.PochoclaDeepgramLiveTransport
+  };
+
+  const liveRuntimeStub = {
+    createLiveProviderSessionRuntime() {
+      return {
+        async start() { return { status: 'streaming' }; },
+        async pushAudio(blob) {
+          pushCalls.push(await blob.text());
+          return { status: 'streaming' };
+        },
+        async flush() {
+          flushCalls += 1;
+          return { status: 'streaming' };
+        },
+        async stop() {
+          stopCalls += 1;
+          return { status: 'stopped' };
+        },
+        onError() { return () => {}; },
+        onFallback() { return () => {}; }
+      };
+    }
+  };
+
+  const liveTransportStub = {
+    createDeepgramLiveTransport() {
+      return {
+        async connect() { return true; },
+        async send() { return true; },
+        async close() { return true; },
+        onMessage() { return () => {}; },
+        onError() { return () => {}; },
+        onClose() { return () => {}; }
+      };
+    }
+  };
+
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return {
+          getTracks() {
+            return [{ stop() {} }];
+          }
+        };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { requiresPCM: false };
+    }
+  });
+  setGlobalValue('PochoclaLiveProviderSessionRuntime', liveRuntimeStub);
+  setGlobalValue('PochoclaDeepgramLiveTransport', liveTransportStub);
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'startLiveSession',
+      streamId: 'stream-live',
+      providerId: 'deepgram',
+      providerConfig: { apiKey: 'dg-key', liveEnabled: true },
+      sessionContext: {
+        sessionId: 'session-live',
+        language: 'es',
+        activeProvider: 'deepgram'
+      }
+    });
+
+    assert.equal(started.ok, true);
+    const liveRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 250);
+    assert.equal(!!liveRecorder, true);
+
+    liveRecorder.ondataavailable({
+      data: new Blob(['live-opus-chunk'], { type: 'audio/webm;codecs=opus' })
+    });
+    await waitFor(() => pushCalls.length === 1, 200);
+    assert.deepEqual(pushCalls, ['live-opus-chunk']);
+
+    const flushed = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'flushLiveSession' });
+    assert.equal(flushed.ok, true);
+    assert.equal(flushCalls, 1);
+
+    const stopped = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stopLiveSession' });
+    assert.equal(stopped.ok, true);
+    assert.equal(stopCalls, 1);
+    assert.equal(flushCalls >= 2, true);
+    assert.equal(
+      sentMessages.some((message) => message && message.target === 'background' && message.action === 'processChunk'),
+      false
+    );
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Object.entries(originals).forEach(([key, value]) => {
+      setGlobalValue(key, value);
+    });
+  }
+});
+
+test('offscreen promoteBatchFallback stops live pipeline and resumes chunk capture without tearing shared media down', async () => {
+  const sentMessages = [];
+  let processChunkCalls = 0;
+
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => {
+      processChunkCalls += 1;
+      return { ok: true };
+    }
+  });
+  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+  chrome.runtime.sendMessage = (message, callback) => {
+    sentMessages.push(message);
+    return originalSendMessage(message, callback);
+  };
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
+    PochoclaLiveProviderSessionRuntime: global.PochoclaLiveProviderSessionRuntime,
+    PochoclaDeepgramLiveTransport: global.PochoclaDeepgramLiveTransport
+  };
+
+  let flushCalls = 0;
+  let stopCalls = 0;
+  const liveRuntimeStub = {
+    createLiveProviderSessionRuntime() {
+      return {
+        async start() { return { status: 'streaming' }; },
+        async pushAudio() { return { status: 'streaming' }; },
+        async flush() {
+          flushCalls += 1;
+          return { status: 'streaming' };
+        },
+        async stop() {
+          stopCalls += 1;
+          return { status: 'stopped' };
+        },
+        onError() { return () => {}; },
+        onFallback() { return () => {}; }
+      };
+    }
+  };
+
+  const liveTransportStub = {
+    createDeepgramLiveTransport() {
+      return {
+        async connect() { return true; },
+        async send() { return true; },
+        async close() { return true; },
+        onMessage() { return () => {}; },
+        onError() { return () => {}; },
+        onClose() { return () => {}; }
+      };
+    }
+  };
+
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return {
+          getTracks() {
+            return [{ stop() {} }];
+          }
+        };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { requiresPCM: false };
+    }
+  });
+  setGlobalValue('PochoclaLiveProviderSessionRuntime', liveRuntimeStub);
+  setGlobalValue('PochoclaDeepgramLiveTransport', liveTransportStub);
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'startLiveSession',
+      streamId: 'stream-fallback',
+      providerId: 'deepgram',
+      providerConfig: { apiKey: 'dg-key', liveEnabled: true },
+      sessionContext: {
+        sessionId: 'session-fallback',
+        language: 'es',
+        activeProvider: 'deepgram'
+      }
+    });
+
+    assert.equal(started.ok, true);
+    await waitFor(() => FakeAudioContext.instances.length > 0, 100);
+    const audioContext = FakeAudioContext.instances[0];
+    const liveRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 250);
+    assert.equal(!!liveRecorder, true);
+
+    const promoted = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'promoteBatchFallback',
+      sessionId: 'session-fallback',
+      sessionContext: {
+        sessionId: 'session-fallback',
+        language: 'es',
+        activeProvider: 'deepgram',
+        chunkIntervalMs: 20
+      }
+    });
+    assert.equal(promoted.ok, true);
+    assert.equal(stopCalls, 1);
+    assert.equal(flushCalls >= 1, true);
+    assert.equal(audioContext.processorNodes.length >= 2, true);
+
+    const chunkProcessorNode = audioContext.processorNodes.at(-1);
+    chunkProcessorNode.emitAudio([0.2, -0.18, 0.15, -0.1, 0.08, -0.05, 0.03, -0.02]);
+    await waitFor(() => processChunkCalls >= 1, 500);
+
+    assert.equal(
+      sentMessages.some((message) => message && message.target === 'background' && message.action === 'processChunk'),
+      true
+    );
+
+    const stopped = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop' });
+    assert.deepEqual(stopped, { ok: true });
+  } finally {
+    delete require.cache[require.resolve(OFFSCREEN_PATH)];
+    Object.entries(originals).forEach(([key, value]) => {
+      setGlobalValue(key, value);
+    });
+  }
+});
+
+test('offscreen leaves PCM transcoding branch inactive for current live providers', async () => {
+  const chrome = createChromeForOffscreen({
+    onProcessChunk: async () => ({ ok: true })
+  });
+
+  const originals = {
+    chrome: global.chrome,
+    navigator: global.navigator,
+    AudioContext: global.AudioContext,
+    MediaRecorder: global.MediaRecorder,
+    PochoclaChunkProcessor: global.PochoclaChunkProcessor,
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
+    PochoclaLiveProviderSessionRuntime: global.PochoclaLiveProviderSessionRuntime,
+    PochoclaDeepgramLiveTransport: global.PochoclaDeepgramLiveTransport
+  };
+
+  const pushCalls = [];
+  const runtimeStartArgs = [];
+  const liveRuntimeStub = {
+    providerRequiresPCM() {
+      return false;
+    },
+    async transcodeToPCM() {
+      throw new Error('should not transcode');
+    },
+    createLiveProviderSessionRuntime() {
+      return {
+        async start(config) {
+          runtimeStartArgs.push(config);
+          return { status: 'streaming' };
+        },
+        async pushAudio(blob) {
+          pushCalls.push(await blob.text());
+          return { status: 'streaming' };
+        },
+        async flush() { return { status: 'streaming' }; },
+        async stop() { return { status: 'stopped' }; },
+        onConnect() { return () => {}; },
+        onReconnect() { return () => {}; },
+        onClose() { return () => {}; },
+        onError() { return () => {}; },
+        onFallback() { return () => {}; }
+      };
+    }
+  };
+
+  const liveTransportStub = {
+    createDeepgramLiveTransport() {
+      return {
+        async connect() { return true; },
+        async send() { return true; },
+        async close() { return true; },
+        onMessage() { return () => {}; },
+        onError() { return () => {}; },
+        onClose() { return () => {}; }
+      };
+    }
+  };
+
+  FakeMediaRecorder.instances = [];
+  FakeAudioContext.instances = [];
+  setGlobalValue('chrome', chrome);
+  setGlobalValue('navigator', {
+    mediaDevices: {
+      async getUserMedia() {
+        return { getTracks() { return [{ stop() {} }]; } };
+      }
+    }
+  });
+  setGlobalValue('AudioContext', FakeAudioContext);
+  setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
+  setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { requiresPCM: false };
+    }
+  });
+  setGlobalValue('PochoclaLiveProviderSessionRuntime', liveRuntimeStub);
+  setGlobalValue('PochoclaDeepgramLiveTransport', liveTransportStub);
+
+  delete require.cache[require.resolve(OFFSCREEN_PATH)];
+  require(OFFSCREEN_PATH);
+
+  try {
+    const started = await chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: 'startLiveSession',
+      streamId: 'stream-no-pcm',
+      providerId: 'deepgram',
+      providerConfig: { apiKey: 'dg-key', liveEnabled: true },
+      sessionContext: {
+        sessionId: 'session-no-pcm',
+        language: 'es',
+        activeProvider: 'deepgram'
+      }
+    });
+
+    assert.equal(started.ok, true);
+    assert.equal(runtimeStartArgs.length, 1);
+    assert.equal(runtimeStartArgs[0].audioFormat, 'audio/webm;codecs=opus');
+    assert.equal(runtimeStartArgs[0].requiresPCM, false);
+    const liveRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 250);
+    liveRecorder.ondataavailable({ data: new Blob(['direct-webm'], { type: 'audio/webm;codecs=opus' }) });
+    await waitFor(() => pushCalls.length === 1, 200);
+    assert.deepEqual(pushCalls, ['direct-webm']);
   } finally {
     delete require.cache[require.resolve(OFFSCREEN_PATH)];
     Object.entries(originals).forEach(([key, value]) => {

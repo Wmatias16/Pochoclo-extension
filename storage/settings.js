@@ -23,7 +23,7 @@
       defaultProvider: 'openai',
       providers: {
         openai: { enabled: true, apiKey: '' },
-        deepgram: { enabled: false, apiKey: '' },
+        deepgram: { enabled: false, apiKey: '', liveEnabled: false },
         assemblyai: { enabled: false, apiKey: '' },
         groq: { enabled: false, apiKey: '' },
         google: { enabled: false, apiKey: '' },

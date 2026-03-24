@@ -433,6 +433,172 @@ test('OpenAI chunk payload survives runtime messaging serialization before adapt
   assert.equal(chunkResult.providerId, 'openai');
 });
 
+test('live Deepgram sessions start via startLiveSession and preserve batch flow for non-live providers', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  settings.defaultProvider = 'deepgram';
+  settings.providers.deepgram.liveEnabled = true;
+
+  const liveHarness = createHarness({
+    initialStorage: { providerSettings: settings },
+    adapterBehaviors: {
+      deepgramLiveTransport: {
+        connect: async () => true,
+        send: async () => true,
+        close: async () => true
+      }
+    }
+  });
+  t.after(() => liveHarness.dispose());
+
+  const liveStarted = await liveHarness.startCapture();
+  assert.equal(liveStarted.ok, true);
+  assert.equal(liveStarted.transcriptSession.providerPlan[0], 'deepgram');
+
+  const liveStartMessage = liveHarness.chrome.__sentMessages.find(
+    (message) => message.target === 'offscreen' && message.action === 'startLiveSession'
+  );
+  assert.equal(!!liveStartMessage, true);
+  assert.equal(liveStartMessage.providerId, 'deepgram');
+
+  const batchHarness = createHarness({
+    initialStorage: { providerSettings: createBaseSettings() }
+  });
+  t.after(() => batchHarness.dispose());
+
+  const batchStarted = await batchHarness.startCapture();
+  assert.equal(batchStarted.ok, true);
+
+  const batchStartMessage = batchHarness.chrome.__sentMessages.find(
+    (message) => message.target === 'offscreen' && message.action === 'start'
+  );
+  assert.equal(!!batchStartMessage, true);
+  assert.equal(
+    batchHarness.chrome.__sentMessages.some((message) => message.target === 'offscreen' && message.action === 'startLiveSession'),
+    false
+  );
+});
+
+test('complete live happy path persists final transcript, interim updates, and live mode metadata', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  settings.defaultProvider = 'deepgram';
+  settings.providers.deepgram.liveEnabled = true;
+
+  const harness = createHarness({
+    initialStorage: { providerSettings: settings },
+    adapterBehaviors: {
+      deepgramLiveTransport: {
+        connect: async () => true,
+        send: async () => true,
+        close: async () => true
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const background = require('../background.js');
+  const started = await harness.startCapture();
+  assert.equal(started.ok, true);
+
+  await background.handleLiveConnect({ action: 'liveConnect', sessionId: started.transcriptSession.id, providerId: 'deepgram', at: 1 });
+  const partial = await background.applyLiveTranscriptEvent({
+    action: 'livePartial',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    text: 'hola parc',
+    at: 2
+  });
+  assert.equal(partial.liveTranscript.interim, 'hola parc');
+
+  const final = await background.applyLiveTranscriptEvent({
+    action: 'liveFinal',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    text: 'hola parcial final',
+    at: 3
+  });
+  assert.equal(final.liveTranscript.final, 'hola parcial final ');
+  assert.equal(final.liveTranscript.interim, '');
+
+  await background.handleLiveClose({ action: 'liveClose', sessionId: started.transcriptSession.id, providerId: 'deepgram', at: 4 });
+  const stopped = await harness.stopCapture();
+  assert.equal(stopped.ok, true);
+
+  const saved = await harness.getSavedTranscriptions();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].mode, 'live');
+  assert.equal(saved[0].text, 'hola parcial final');
+  assert.equal(saved[0].terminalStatus, 'completed');
+  assert.deepEqual(saved[0].providerAttribution, ['deepgram-live']);
+});
+
+test('reconnect exhaustion falls back to batch without duplicating live finals', { concurrency: false }, async (t) => {
+  const settings = createBaseSettings();
+  settings.defaultProvider = 'deepgram';
+  settings.providers.deepgram.liveEnabled = true;
+
+  const harness = createHarness({
+    initialStorage: { providerSettings: settings },
+    adapterBehaviors: {
+      deepgramLiveTransport: {
+        connect: async () => true,
+        send: async () => true,
+        close: async () => true
+      },
+      deepgram: {
+        async transcribe() {
+          return { text: 'batch continua' };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const background = require('../background.js');
+  const started = await harness.startCapture();
+  assert.equal(started.ok, true);
+
+  await background.handleLiveConnect({ action: 'liveConnect', sessionId: started.transcriptSession.id, providerId: 'deepgram', at: 1 });
+  await background.applyLiveTranscriptEvent({
+    action: 'liveFinal',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    text: 'segmento live',
+    at: 2
+  });
+  await background.handleLiveReconnect({
+    action: 'liveReconnect',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    reconnects: 2,
+    at: 3
+  });
+  await background.handleLiveFallback({
+    action: 'liveFallback',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    reason: 'reconnect_exhausted',
+    reconnects: 2,
+    at: 4
+  });
+
+  const chunkResult = await harness.dispatchChunk({
+    sessionId: started.transcriptSession.id,
+    chunkIndex: 0,
+    body: 'batch-audio'
+  });
+  assert.equal(chunkResult.ok, true);
+  assert.equal((await harness.getTranscript()).final, 'segmento live batch continua ');
+
+  const stopped = await harness.stopCapture();
+  assert.equal(stopped.ok, true);
+
+  const saved = await harness.getSavedTranscriptions();
+  assert.equal(saved[0].text, 'segmento live batch continua');
+  assert.deepEqual(saved[0].providerAttribution, ['deepgram-live', 'deepgram-batch']);
+  assert.equal(saved[0].fallbackReason, 'reconnect_exhausted');
+  assert.equal(saved[0].terminalStatus, 'fallback-to-batch');
+});
+
 test('summarizeTranscription fails fast on missing_api_key, not_found, and empty_text', { concurrency: false }, async (t) => {
   const settingsWithoutApiKey = createBaseSettings();
   settingsWithoutApiKey.providers.openai.apiKey = '';

@@ -403,6 +403,7 @@ async function loadPopupHarness(options = {}) {
       providers: [{ id: 'openai', label: 'OpenAI' }]
     },
     getTranscriptionSession: { ok: true, transcriptSession: null },
+    getLiveTranscript: { ok: true, liveTranscript: null },
     getTranscriptions: [],
     ...(options.runtimeResponses || {})
   };
@@ -411,6 +412,7 @@ async function loadPopupHarness(options = {}) {
   let nextTimerId = 1;
   let now = 0;
   const timers = new Map();
+  const intervalTimers = new Map();
   const unloadListeners = [];
   const originals = {
     chrome: global.chrome,
@@ -437,21 +439,44 @@ async function loadPopupHarness(options = {}) {
     return nextTimerId;
   }
 
+  function scheduleInterval(callback, delay = 0) {
+    nextTimerId += 1;
+    const normalizedDelay = Math.max(0, Number(delay) || 0);
+    intervalTimers.set(nextTimerId, {
+      callback,
+      delay: normalizedDelay,
+      dueAt: now + normalizedDelay
+    });
+    return nextTimerId;
+  }
+
   function advanceTimers(ms) {
     now += ms;
     let executed = true;
 
     while (executed) {
       executed = false;
-      const dueTimers = Array.from(timers.entries())
-        .filter(([, timer]) => timer.dueAt <= now)
-        .sort((left, right) => left[1].dueAt - right[1].dueAt);
+      const dueTimers = [
+        ...Array.from(timers.entries()).map(([id, timer]) => ({ id, timer, type: 'timeout' })),
+        ...Array.from(intervalTimers.entries()).map(([id, timer]) => ({ id, timer, type: 'interval' }))
+      ]
+        .filter(({ timer }) => timer.dueAt <= now)
+        .sort((left, right) => left.timer.dueAt - right.timer.dueAt);
 
-      dueTimers.forEach(([id, timer]) => {
-        if (!timers.has(id)) {
+      dueTimers.forEach(({ id, timer, type }) => {
+        const activeTimers = type === 'interval' ? intervalTimers : timers;
+        if (!activeTimers.has(id)) {
           return;
         }
-        timers.delete(id);
+        if (type === 'interval') {
+          const intervalTimer = intervalTimers.get(id);
+          intervalTimers.set(id, {
+            ...intervalTimer,
+            dueAt: now + intervalTimer.delay
+          });
+        } else {
+          timers.delete(id);
+        }
         executed = true;
         timer.callback();
       });
@@ -480,8 +505,8 @@ async function loadPopupHarness(options = {}) {
   global.cancelAnimationFrame = (id) => timers.delete(id);
   global.setTimeout = (callback, delay) => scheduleTimer(callback, delay);
   global.clearTimeout = (id) => timers.delete(id);
-  global.setInterval = () => nextTimerId += 1;
-  global.clearInterval = () => {};
+  global.setInterval = (callback, delay) => scheduleInterval(callback, delay);
+  global.clearInterval = (id) => intervalTimers.delete(id);
   global.PochoclaPopupSummaryUI = popupSummaryUi;
 
   delete require.cache[require.resolve(POPUP_PATH)];
@@ -698,4 +723,56 @@ test('popup stop clears live transcript and progress, then navigates to refreshe
   assert.match(popup.document.getElementById('historyList').children[0].innerHTML, /Reunión finalizada/);
   assert.equal(popup.document.getElementById('statusBadge').textContent, 'Finalizado');
   assert.equal(popup.document.getElementById('timerLabel').textContent, 'Grabación finalizada');
+});
+
+test('popup renders live interim text with a distinct class and uses faster live polling', async (t) => {
+  let liveTranscriptRequests = 0;
+  const popup = await loadPopupHarness({
+    stateResponse: { status: 'recording', startTime: Date.now() - 2_000, pausedAt: 0, pausedDuration: 0 },
+    initialStorage: {
+      transcript: {
+        final: 'Texto final ',
+        interim: '',
+        mode: 'live'
+      }
+    },
+    runtimeResponses: {
+      getTranscriptionSession: {
+        ok: true,
+        transcriptSession: {
+          id: 'session-live-ui',
+          mode: 'live'
+        }
+      },
+      getLiveTranscript: () => {
+        liveTranscriptRequests += 1;
+        return {
+          ok: true,
+          liveTranscript: {
+            sessionId: 'session-live-ui',
+            text: 'Texto final ',
+            final: 'Texto final ',
+            interim: 'interim visible',
+            mode: 'live',
+            pollIntervalMs: 150
+          }
+        };
+      }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.advanceTimers(150);
+  await popup.flush();
+  popup.advanceTimers(150);
+  await popup.flush();
+  popup.advanceTimers(150);
+  await popup.flush();
+
+  assert.equal(liveTranscriptRequests >= 1, true);
+  assert.equal(popup.document.getElementById('transcriptText').textContent.includes('Texto final '), true);
+  const interimEl = popup.document.getElementById('transcriptText').querySelector('.interim');
+  assert.equal(!!interimEl, true);
+  assert.equal(interimEl.textContent, ' interim visible');
+  assert.equal(interimEl.classList.contains('transcript-interim'), true);
 });

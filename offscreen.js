@@ -3,14 +3,20 @@
 
 let mediaStream = null;
 let mediaRecorder = null;
+let liveMediaRecorder = null;
 let audioContext = null;
 let analyser = null;
 let mediaStreamSource = null;
 let audioChunks = [];
 const chunkProcessor = globalThis.PochoclaChunkProcessor;
 const offscreenBridge = globalThis.PochoclaOffscreenBridge;
+const liveProviderSessionRuntime = globalThis.PochoclaLiveProviderSessionRuntime;
+const deepgramLiveTransportRuntime = globalThis.PochoclaDeepgramLiveTransport;
+const providerRegistry = globalThis.PochoclaProviderRegistry || null;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const DEFAULT_WAV_SAMPLE_RATE = 48000;
+const DEFAULT_LIVE_RECORDER_TIMESLICE_MS = 250;
+const LIVE_MEDIA_RECORDER_MIME_TYPE = 'audio/webm;codecs=opus';
 // Significant-amplitude threshold for the V1 inactivity proxy shared with background defaults.
 const PCM_AUDIO_THRESHOLD = 0.05;
 const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
@@ -25,6 +31,20 @@ let captureSessionContext = {
   chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
 };
 
+let liveCaptureContext = {
+  sessionId: null,
+  providerId: null,
+  audioFormat: null,
+  runtime: null,
+  transport: null,
+  recorderTimesliceMs: DEFAULT_LIVE_RECORDER_TIMESLICE_MS,
+  sendChain: Promise.resolve(),
+  monitorNode: null,
+  stopping: false
+};
+
+let currentCaptureMode = 'idle';
+
 function resetCaptureSessionContext() {
   captureSessionContext = {
     sessionId: null,
@@ -32,6 +52,20 @@ function resetCaptureSessionContext() {
     activeProvider: null,
     nextChunkIndex: 0,
     chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+}
+
+function resetLiveCaptureContext() {
+  liveCaptureContext = {
+    sessionId: null,
+    providerId: null,
+    audioFormat: null,
+    runtime: null,
+    transport: null,
+    recorderTimesliceMs: DEFAULT_LIVE_RECORDER_TIMESLICE_MS,
+    sendChain: Promise.resolve(),
+    monitorNode: null,
+    stopping: false
   };
 }
 
@@ -45,8 +79,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'stop':
-      stopRecording().then(() => sendResponse({ ok: true }))
+      stopCurrentCapture().then(() => sendResponse({ ok: true }))
         .catch(() => sendResponse({ ok: true }));
+      return true;
+
+    case 'startLiveSession':
+      startLive(msg).then(() => sendResponse({ ok: true }))
+        .catch(err => sendResponse({ ok: false, error: err.message }));
+      return true;
+
+    case 'stopLiveSession':
+      stopLive().then(() => sendResponse({ ok: true }))
+        .catch(() => sendResponse({ ok: true }));
+      return true;
+
+    case 'promoteBatchFallback':
+      promoteBatchFallback(msg).then(() => sendResponse({ ok: true }))
+        .catch(err => sendResponse({ ok: false, error: err.message }));
+      return true;
+
+    case 'flushLiveSession':
+      flushLive(msg).then(() => sendResponse({ ok: true }))
+        .catch(err => sendResponse({ ok: false, error: err.message }));
       return true;
 
     case 'pause':
@@ -66,6 +120,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function startRecording(streamId, sessionContext) {
+  currentCaptureMode = 'batch';
   captureSessionContext = {
     sessionId: sessionContext && sessionContext.sessionId ? sessionContext.sessionId : null,
     language: sessionContext && sessionContext.language ? sessionContext.language : 'es',
@@ -76,25 +131,10 @@ async function startRecording(streamId, sessionContext) {
       : DEFAULT_TRANSCRIPTION_CHUNK_MS
   };
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      mandatory: {
-        chromeMediaSource: 'tab',
-        chromeMediaSourceId: streamId
-      }
-    }
-  });
-
-  audioContext = new AudioContext();
-  mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
-  analyser = audioContext.createAnalyser();
-  analyser.fftSize = 64;
-  analyser.smoothingTimeConstant = 0.8;
-  mediaStreamSource.connect(analyser);
-  mediaStreamSource.connect(audioContext.destination);
+  await initializeSharedCapture(streamId);
 
   mediaRecorder = new MediaRecorder(mediaStream, {
-    mimeType: 'audio/webm;codecs=opus'
+    mimeType: LIVE_MEDIA_RECORDER_MIME_TYPE
   });
   audioChunks = [];
 
@@ -109,26 +149,22 @@ async function startRecording(streamId, sessionContext) {
 }
 
 async function stopRecording() {
+  currentCaptureMode = 'idle';
   // 1. Stop capturing new chunks and wait for the final chunk + queue to drain
   await stopTranscriptionCapture();
 
   // 2. Now safe to tear down media resources
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(t => t.stop());
-    mediaStream = null;
-  }
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-    analyser = null;
-    mediaStreamSource = null;
-  }
+  await stopMediaRecorderInstance(mediaRecorder);
+  mediaRecorder = null;
+  await teardownSharedCapture();
 }
 
 function pauseRecording() {
+  if (currentCaptureMode === 'live') {
+    pauseLiveCapture();
+    return;
+  }
+
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.pause();
   }
@@ -136,10 +172,213 @@ function pauseRecording() {
 }
 
 function resumeRecording() {
+  if (currentCaptureMode === 'live') {
+    resumeLiveCapture();
+    return;
+  }
+
   if (mediaRecorder && mediaRecorder.state === 'paused') {
     mediaRecorder.resume();
   }
   startTranscriptionCapture();
+}
+
+async function startLive(config = {}) {
+  const sessionContext = config.sessionContext || {};
+  const providerId = config.providerId || (sessionContext && sessionContext.activeProvider) || null;
+  const providerConfig = config.providerConfig || {};
+  const liveAudioFormat = config.audioFormat || LIVE_MEDIA_RECORDER_MIME_TYPE;
+  const requiresPCM = !!(
+    liveProviderSessionRuntime
+    && typeof liveProviderSessionRuntime.providerRequiresPCM === 'function'
+    && liveProviderSessionRuntime.providerRequiresPCM(providerId, providerRegistry)
+  );
+
+  if (providerId !== 'deepgram') {
+    throw new Error(`Provider live no soportado: ${providerId || 'unknown'}`);
+  }
+
+  currentCaptureMode = 'live';
+  captureSessionContext = {
+    sessionId: sessionContext.sessionId || null,
+    language: sessionContext.language || config.language || 'es',
+    activeProvider: providerId,
+    nextChunkIndex: 0,
+    chunkIntervalMs: DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+
+  await initializeSharedCapture(config.streamId);
+
+  if (!liveProviderSessionRuntime || typeof liveProviderSessionRuntime.createLiveProviderSessionRuntime !== 'function') {
+    throw new Error('No se pudo inicializar el runtime de sesión live');
+  }
+
+  if (!deepgramLiveTransportRuntime || typeof deepgramLiveTransportRuntime.createDeepgramLiveTransport !== 'function') {
+    throw new Error('No se pudo inicializar el transporte live de Deepgram');
+  }
+
+  const transport = deepgramLiveTransportRuntime.createDeepgramLiveTransport({
+    settings: providerConfig,
+    language: sessionContext.language || config.language || 'es'
+  });
+  const runtime = liveProviderSessionRuntime.createLiveProviderSessionRuntime();
+
+  liveCaptureContext = {
+    sessionId: sessionContext.sessionId || null,
+    providerId,
+    audioFormat: liveAudioFormat,
+    runtime,
+    transport,
+    recorderTimesliceMs: Number.isFinite(Number(config.recorderTimesliceMs))
+      ? Number(config.recorderTimesliceMs)
+      : DEFAULT_LIVE_RECORDER_TIMESLICE_MS,
+    sendChain: Promise.resolve(),
+    monitorNode: null,
+    stopping: false
+  };
+
+  attachLiveTransportListeners();
+  attachLiveRuntimeListeners();
+
+  try {
+    await runtime.start({
+      providerId,
+      audioFormat: liveCaptureContext.audioFormat,
+      requiresPCM,
+      transport,
+      flushPayload: { type: 'Finalize' }
+    });
+  } catch (error) {
+    if (error && (error.code === 'startup_failed' || error.code === 'reconnect_exhausted')) {
+      return true;
+    }
+    throw error;
+  }
+
+  startLiveActivityMonitor();
+
+  // Future scaffold only: AssemblyAI/OpenAI Realtime will route through a PCM16
+  // transcoder once a provider advertises `liveAudioFormat === 'pcm16'`.
+  // Current rollout keeps Deepgram on direct MediaRecorder WebM/Opus.
+  if (requiresPCM) {
+    throw new Error(`Provider live no soportado todavía para PCM16: ${providerId || 'unknown'}`);
+  }
+
+  liveMediaRecorder = new MediaRecorder(mediaStream, {
+    mimeType: LIVE_MEDIA_RECORDER_MIME_TYPE
+  });
+
+  liveMediaRecorder.ondataavailable = (event) => {
+    const blob = event && event.data;
+    if (!blob || !Number.isFinite(Number(blob.size)) || Number(blob.size) <= 0) {
+      return;
+    }
+
+    queueLiveAudio(blob, { requiresPCM });
+  };
+
+  liveMediaRecorder.start(liveCaptureContext.recorderTimesliceMs);
+}
+
+async function transcodeToPCM(webmBlob) {
+  if (
+    liveProviderSessionRuntime
+    && typeof liveProviderSessionRuntime.transcodeToPCM === 'function'
+  ) {
+    return liveProviderSessionRuntime.transcodeToPCM(webmBlob);
+  }
+
+  // TODO: Phase future — PCM transcoding for AssemblyAI/OpenAI Realtime.
+  throw new Error('PCM transcoding not yet implemented');
+}
+
+async function flushLive() {
+  if (!liveCaptureContext.runtime) {
+    return false;
+  }
+
+  await liveCaptureContext.sendChain;
+  await liveCaptureContext.runtime.flush();
+  return true;
+}
+
+async function stopLive() {
+  currentCaptureMode = 'idle';
+  return stopLivePipeline({ teardownSharedCapture: true, resetBatchContext: true });
+}
+
+async function stopLivePipeline(options = {}) {
+  const shouldTearDownSharedCapture = options.teardownSharedCapture !== false;
+  const resetBatchContext = options.resetBatchContext !== false;
+
+  if (!liveCaptureContext.runtime && !liveMediaRecorder && !mediaStream) {
+    if (resetBatchContext) {
+      resetCaptureSessionContext();
+    }
+    resetLiveCaptureContext();
+    return;
+  }
+
+  liveCaptureContext.stopping = true;
+
+  await stopMediaRecorderInstance(liveMediaRecorder);
+  liveMediaRecorder = null;
+  await flushLive();
+
+  if (liveCaptureContext.runtime) {
+    await liveCaptureContext.runtime.stop();
+  }
+
+  stopLiveActivityMonitor();
+  if (shouldTearDownSharedCapture) {
+    await teardownSharedCapture();
+  }
+  if (resetBatchContext) {
+    resetCaptureSessionContext();
+  }
+  resetLiveCaptureContext();
+}
+
+async function promoteBatchFallback(message = {}) {
+  const nextSessionContext = message.sessionContext || {};
+
+  await stopLivePipeline({ teardownSharedCapture: false, resetBatchContext: false });
+
+  captureSessionContext = {
+    sessionId: nextSessionContext.sessionId || captureSessionContext.sessionId || null,
+    language: nextSessionContext.language || captureSessionContext.language || 'es',
+    activeProvider: nextSessionContext.activeProvider || captureSessionContext.activeProvider || null,
+    nextChunkIndex: 0,
+    chunkIntervalMs: Number.isFinite(Number(nextSessionContext.chunkIntervalMs))
+      ? Number(nextSessionContext.chunkIntervalMs)
+      : DEFAULT_TRANSCRIPTION_CHUNK_MS
+  };
+
+  currentCaptureMode = 'batch';
+  startTranscriptionCapture();
+  return true;
+}
+
+async function stopCurrentCapture() {
+  if (currentCaptureMode === 'live') {
+    return stopLive();
+  }
+
+  return stopRecording();
+}
+
+function pauseLiveCapture() {
+  if (liveMediaRecorder && liveMediaRecorder.state === 'recording') {
+    liveMediaRecorder.pause();
+  }
+  stopLiveActivityMonitor();
+}
+
+function resumeLiveCapture() {
+  if (liveMediaRecorder && liveMediaRecorder.state === 'paused') {
+    liveMediaRecorder.resume();
+  }
+  startLiveActivityMonitor();
 }
 
 function getWaveformData() {
@@ -162,6 +401,59 @@ let lastAudioHeartbeatAt = 0;
 function resetAudioActivityHeartbeat() {
   // Called on start/pause/stop so a resumed session can emit a fresh heartbeat immediately.
   lastAudioHeartbeatAt = 0;
+}
+
+async function createTabCaptureStream(streamId) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId
+      }
+    }
+  });
+}
+
+async function initializeSharedCapture(streamId) {
+  mediaStream = await createTabCaptureStream(streamId);
+  audioContext = new AudioContext();
+  mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 64;
+  analyser.smoothingTimeConstant = 0.8;
+  mediaStreamSource.connect(analyser);
+  mediaStreamSource.connect(audioContext.destination);
+}
+
+async function stopMediaRecorderInstance(recorder) {
+  if (!recorder || recorder.state === 'inactive') {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    const previousOnStop = recorder.onstop;
+    recorder.onstop = (...args) => {
+      recorder.onstop = previousOnStop;
+      if (typeof previousOnStop === 'function') {
+        previousOnStop(...args);
+      }
+      resolve();
+    };
+    recorder.stop();
+  });
+}
+
+async function teardownSharedCapture() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+  }
+  if (audioContext) {
+    await audioContext.close();
+    audioContext = null;
+    analyser = null;
+    mediaStreamSource = null;
+  }
 }
 
 function emitAudioActivityHeartbeat(now = Date.now()) {
@@ -342,8 +634,23 @@ function encodePcm16Wav(samples, sampleRate) {
 }
 
 function captureInputBufferChunk(inputBuffer) {
-  if (!inputBuffer || typeof inputBuffer.numberOfChannels !== 'number' || typeof inputBuffer.getChannelData !== 'function') {
+  const analysis = analyzeInputBuffer(inputBuffer);
+  if (!analysis) {
     return;
+  }
+
+  if (analysis.rms > PCM_AUDIO_THRESHOLD) {
+    chunkHadAudio = true;
+    emitAudioActivityHeartbeat();
+  }
+
+  transcriptionPcmChunks.push(analysis.monoSamples);
+  transcriptionPcmSampleCount += analysis.monoSamples.length;
+}
+
+function analyzeInputBuffer(inputBuffer) {
+  if (!inputBuffer || typeof inputBuffer.numberOfChannels !== 'number' || typeof inputBuffer.getChannelData !== 'function') {
+    return null;
   }
 
   const channelCount = Math.max(1, inputBuffer.numberOfChannels);
@@ -362,17 +669,213 @@ function captureInputBufferChunk(inputBuffer) {
     sumSquares += monoSample * monoSample;
   }
 
-  const rms = frameLength > 0
-    ? Math.sqrt(sumSquares / frameLength)
-    : 0;
+  return {
+    monoSamples,
+    rms: frameLength > 0 ? Math.sqrt(sumSquares / frameLength) : 0
+  };
+}
 
-  if (rms > PCM_AUDIO_THRESHOLD) {
-    chunkHadAudio = true;
-    emitAudioActivityHeartbeat();
+function monitorLiveInputBuffer(inputBuffer) {
+  const analysis = analyzeInputBuffer(inputBuffer);
+  if (!analysis) {
+    return;
   }
 
-  transcriptionPcmChunks.push(monoSamples);
-  transcriptionPcmSampleCount += monoSamples.length;
+  if (analysis.rms > PCM_AUDIO_THRESHOLD) {
+    emitAudioActivityHeartbeat();
+  }
+}
+
+function startLiveActivityMonitor() {
+  if (!mediaStreamSource || !audioContext || liveCaptureContext.monitorNode) {
+    return;
+  }
+
+  resetAudioActivityHeartbeat();
+
+  if (typeof audioContext.createScriptProcessor !== 'function') {
+    return;
+  }
+
+  const processorNode = audioContext.createScriptProcessor(SCRIPT_PROCESSOR_BUFFER_SIZE, 2, 1);
+  processorNode.onaudioprocess = (event) => {
+    if (currentCaptureMode !== 'live') {
+      return;
+    }
+
+    monitorLiveInputBuffer(event && event.inputBuffer);
+  };
+
+  mediaStreamSource.connect(processorNode);
+  processorNode.connect(audioContext.destination);
+  liveCaptureContext.monitorNode = processorNode;
+}
+
+function stopLiveActivityMonitor() {
+  resetAudioActivityHeartbeat();
+
+  if (!liveCaptureContext.monitorNode) {
+    return;
+  }
+
+  if (mediaStreamSource && typeof mediaStreamSource.disconnect === 'function') {
+    mediaStreamSource.disconnect(liveCaptureContext.monitorNode);
+  }
+  if (typeof liveCaptureContext.monitorNode.disconnect === 'function') {
+    liveCaptureContext.monitorNode.disconnect();
+  }
+  liveCaptureContext.monitorNode.onaudioprocess = null;
+  liveCaptureContext.monitorNode = null;
+}
+
+function attachLiveTransportListeners() {
+  if (!liveCaptureContext.transport) {
+    return;
+  }
+
+  liveCaptureContext.transport.onMessage((event) => {
+    if (!event || !event.type) {
+      return;
+    }
+
+    if (event.type === 'partial') {
+      dispatchLiveEventToBackground('partial', {
+        text: event.text,
+        providerId: event.providerId,
+        meta: event.raw || null
+      });
+      return;
+    }
+
+    if (event.type === 'final') {
+      dispatchLiveEventToBackground('final', {
+        text: event.text,
+        providerId: event.providerId,
+        meta: event.raw || null
+      });
+    }
+  });
+
+  liveCaptureContext.transport.onError((error) => {
+    dispatchLiveEventToBackground('error', {
+      providerId: liveCaptureContext.providerId,
+      code: error && error.code ? error.code : 'live_transport_error',
+      message: error && error.message ? error.message : 'Falló el transporte live.',
+      retryable: !!(error && error.retryable)
+    });
+  });
+}
+
+function attachLiveRuntimeListeners() {
+  if (!liveCaptureContext.runtime) {
+    return;
+  }
+
+  if (typeof liveCaptureContext.runtime.onConnect === 'function') {
+    liveCaptureContext.runtime.onConnect((payload = {}) => {
+      dispatchLiveEventToBackground('connect', {
+        providerId: payload.providerId || liveCaptureContext.providerId,
+        reconnects: payload.reconnects || 0,
+        meta: payload
+      });
+    });
+  }
+
+  if (typeof liveCaptureContext.runtime.onReconnect === 'function') {
+    liveCaptureContext.runtime.onReconnect((payload = {}) => {
+      dispatchLiveEventToBackground('reconnect', {
+        providerId: payload.providerId || liveCaptureContext.providerId,
+        reconnects: payload.reconnects || 0,
+        meta: payload
+      });
+    });
+  }
+
+  liveCaptureContext.runtime.onError((payload = {}) => {
+    dispatchLiveEventToBackground('error', {
+      providerId: payload.providerId || liveCaptureContext.providerId,
+      code: payload.reason || 'live_transport_error',
+      message: payload.error && payload.error.message ? payload.error.message : 'Falló la sesión live.',
+      reconnects: payload.reconnects || 0
+    });
+  });
+
+  liveCaptureContext.runtime.onFallback((payload = {}) => {
+    dispatchLiveEventToBackground('fallback', {
+      providerId: payload.providerId || liveCaptureContext.providerId,
+      reason: payload.reason || 'reconnect_exhausted',
+      reconnects: payload.reconnects || 0,
+      error: payload.error && payload.error.message ? payload.error.message : null
+    });
+  });
+
+  if (typeof liveCaptureContext.runtime.onClose === 'function') {
+    liveCaptureContext.runtime.onClose((payload = {}) => {
+      dispatchLiveEventToBackground('close', {
+        providerId: payload.providerId || liveCaptureContext.providerId,
+        reconnects: payload.reconnects || 0,
+        meta: payload
+      });
+    });
+  }
+}
+
+function queueLiveAudio(blob, options = {}) {
+  if (!liveCaptureContext.runtime) {
+    return;
+  }
+
+  liveCaptureContext.sendChain = liveCaptureContext.sendChain
+    .catch(() => {})
+    .then(async () => {
+      if (options.requiresPCM) {
+        // TODO: Phase future — PCM transcoding for AssemblyAI/OpenAI Realtime.
+        // Current providers never hit this branch because registry capabilities keep
+        // `liveAudioFormat` on non-PCM values (Deepgram: `webm/opus`).
+        const pcmBlob = await transcodeToPCM(blob);
+        return liveCaptureContext.runtime.pushAudio(pcmBlob);
+      }
+
+      return liveCaptureContext.runtime.pushAudio(blob);
+    });
+}
+
+function dispatchLiveEventToBackground(type, payload = {}) {
+  if (!offscreenBridge || typeof offscreenBridge.dispatchToBackground !== 'function') {
+    return Promise.resolve({ ok: false, ignored: true });
+  }
+
+  const messageBuilders = {
+    connect: offscreenBridge.buildLiveConnectMessage,
+    partial: offscreenBridge.buildLivePartialMessage,
+    final: offscreenBridge.buildLiveFinalMessage,
+    error: offscreenBridge.buildLiveErrorMessage,
+    fallback: offscreenBridge.buildLiveFallbackMessage,
+    reconnect: offscreenBridge.buildLiveReconnectMessage,
+    close: offscreenBridge.buildLiveCloseMessage
+  };
+  const buildMessage = messageBuilders[type];
+
+  if (typeof buildMessage !== 'function') {
+    return Promise.resolve({ ok: false, ignored: true });
+  }
+
+  try {
+    const maybePromise = offscreenBridge.dispatchToBackground(
+      buildMessage({
+        sessionId: liveCaptureContext.sessionId,
+        providerId: payload.providerId || liveCaptureContext.providerId,
+        ...payload
+      }),
+      chrome.runtime.sendMessage
+    );
+
+    return maybePromise && typeof maybePromise.then === 'function'
+      ? maybePromise.catch(() => ({ ok: false, ignored: true }))
+      : Promise.resolve(maybePromise);
+  } catch (error) {
+    return Promise.resolve({ ok: false, ignored: true });
+  }
 }
 
 function flushTranscriptionChunk(options = {}) {

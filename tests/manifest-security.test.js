@@ -37,6 +37,6 @@ test('manifest declares explicit extension page CSP without remote font origins'
   const manifest = readManifest();
 
   assert.deepEqual(manifest.content_security_policy, {
-    extension_pages: "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'"
+    extension_pages: "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' https://api.openai.com https://api.deepgram.com wss://api.deepgram.com https://api.assemblyai.com https://api.groq.com https://speech.googleapis.com http://127.0.0.1:* http://localhost:*"
   });
 });

@@ -16,6 +16,7 @@ const providerRegistry = globalThis.PochoclaProviderRegistry || null;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const DEFAULT_WAV_SAMPLE_RATE = 48000;
 const DEFAULT_LIVE_RECORDER_TIMESLICE_MS = 250;
+const DEFAULT_BATCH_RECORDER_TIMESLICE_MS = 1000;
 const LIVE_MEDIA_RECORDER_MIME_TYPE = 'audio/webm;codecs=opus';
 // Significant-amplitude threshold for the V1 inactivity proxy shared with background defaults.
 const PCM_AUDIO_THRESHOLD = 0.05;
@@ -44,6 +45,7 @@ let liveCaptureContext = {
 };
 
 let currentCaptureMode = 'idle';
+let batchTranscriptionMode = null;
 
 function resetCaptureSessionContext() {
   captureSessionContext = {
@@ -133,28 +135,17 @@ async function startRecording(streamId, sessionContext) {
 
   await initializeSharedCapture(streamId);
 
-  mediaRecorder = new MediaRecorder(mediaStream, {
-    mimeType: LIVE_MEDIA_RECORDER_MIME_TYPE
-  });
-  audioChunks = [];
-
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0) audioChunks.push(e.data);
-  };
-
-  mediaRecorder.start(1000);
-
-  // Start transcription capture (hands chunks to background orchestration)
-  startTranscriptionCapture();
+  startBatchMediaRecorder();
+  startBatchTranscriptionCapture();
 }
 
 async function stopRecording() {
   currentCaptureMode = 'idle';
-  // 1. Stop capturing new chunks and wait for the final chunk + queue to drain
-  await stopTranscriptionCapture();
 
-  // 2. Now safe to tear down media resources
-  await stopMediaRecorderInstance(mediaRecorder);
+  // 1. Stop capturing new chunks and wait for the final chunk + queue to drain.
+  await stopBatchTranscriptionCapture();
+
+  // 2. Now safe to tear down media resources.
   mediaRecorder = null;
   await teardownSharedCapture();
 }
@@ -168,7 +159,7 @@ function pauseRecording() {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.pause();
   }
-  stopTranscriptionCapture();
+  pauseBatchTranscriptionCapture();
 }
 
 function resumeRecording() {
@@ -180,7 +171,7 @@ function resumeRecording() {
   if (mediaRecorder && mediaRecorder.state === 'paused') {
     mediaRecorder.resume();
   }
-  startTranscriptionCapture();
+  startBatchTranscriptionCapture();
 }
 
 async function startLive(config = {}) {
@@ -355,7 +346,8 @@ async function promoteBatchFallback(message = {}) {
   };
 
   currentCaptureMode = 'batch';
-  startTranscriptionCapture();
+  startBatchMediaRecorder();
+  startBatchTranscriptionCapture();
   return true;
 }
 
@@ -397,6 +389,24 @@ let transcriptionSampleRate = DEFAULT_WAV_SAMPLE_RATE;
 let isTranscribing = false;
 let chunkHadAudio = false;       // tracks audio activity DURING each chunk
 let lastAudioHeartbeatAt = 0;
+
+function normalizeAudioCapabilityFormat(audioFormat) {
+  if (typeof audioFormat !== 'string') {
+    return null;
+  }
+
+  const normalized = audioFormat.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function batchCaptureRequiresPCM(providerId = captureSessionContext.activeProvider) {
+  if (!providerRegistry || typeof providerRegistry.getProviderDefinition !== 'function') {
+    return false;
+  }
+
+  const definition = providerRegistry.getProviderDefinition(providerId);
+  return normalizeAudioCapabilityFormat(definition && definition.liveAudioFormat) === 'pcm16';
+}
 
 function resetAudioActivityHeartbeat() {
   // Called on start/pause/stop so a resumed session can emit a fresh heartbeat immediately.
@@ -486,6 +496,165 @@ function emitAudioActivityHeartbeat(now = Date.now()) {
   }
 
   return true;
+}
+
+function clearTranscriptionChunkTimer() {
+  clearInterval(transcriptionChunkTimerId);
+  transcriptionChunkTimerId = null;
+}
+
+function disconnectTranscriptionProcessorNode() {
+  if (!transcriptionProcessorNode) {
+    return;
+  }
+
+  if (mediaStreamSource && typeof mediaStreamSource.disconnect === 'function') {
+    mediaStreamSource.disconnect(transcriptionProcessorNode);
+  }
+  if (typeof transcriptionProcessorNode.disconnect === 'function') {
+    transcriptionProcessorNode.disconnect();
+  }
+  transcriptionProcessorNode.onaudioprocess = null;
+  transcriptionProcessorNode = null;
+}
+
+function startBatchMediaRecorder() {
+  if (!mediaStream) {
+    throw new Error('No hay un stream de audio disponible para grabar');
+  }
+
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    return mediaRecorder;
+  }
+
+  mediaRecorder = new MediaRecorder(mediaStream, {
+    mimeType: LIVE_MEDIA_RECORDER_MIME_TYPE
+  });
+  audioChunks = [];
+
+  mediaRecorder.ondataavailable = (event) => {
+    const blob = event && event.data;
+    if (!blob || !Number.isFinite(Number(blob.size)) || Number(blob.size) <= 0) {
+      return;
+    }
+
+    audioChunks.push(blob);
+  };
+
+  mediaRecorder.start(DEFAULT_BATCH_RECORDER_TIMESLICE_MS);
+  return mediaRecorder;
+}
+
+function buildBatchAudioChunkBlob() {
+  if (!Array.isArray(audioChunks) || audioChunks.length === 0) {
+    return null;
+  }
+
+  const mimeType = audioChunks.find((chunk) => chunk && typeof chunk.type === 'string' && chunk.type.length > 0)?.type
+    || 'audio/webm';
+  const blob = new Blob(audioChunks, { type: mimeType });
+  audioChunks = [];
+  return blob;
+}
+
+function flushRecordedAudioChunk() {
+  const blob = buildBatchAudioChunkBlob();
+  if (!blob || !Number.isFinite(Number(blob.size)) || Number(blob.size) <= 0) {
+    return false;
+  }
+
+  enqueueTranscription(blob);
+  return true;
+}
+
+function startMediaRecorderBatchTranscriptionCapture() {
+  if (!mediaRecorder || isTranscribing) {
+    return;
+  }
+
+  isTranscribing = true;
+  clearTranscriptionChunkTimer();
+  transcriptionChunkTimerId = setInterval(() => {
+    flushRecordedAudioChunk();
+    resolveTranscriptionDrainIfReady();
+  }, captureSessionContext.chunkIntervalMs || DEFAULT_TRANSCRIPTION_CHUNK_MS);
+}
+
+function pauseMediaRecorderBatchTranscriptionCapture() {
+  isTranscribing = false;
+  clearTranscriptionChunkTimer();
+  flushRecordedAudioChunk();
+  resolveTranscriptionDrainIfReady();
+}
+
+async function stopMediaRecorderBatchTranscriptionCapture() {
+  clearTranscriptionChunkTimer();
+  await stopMediaRecorderInstance(mediaRecorder);
+  isTranscribing = false;
+  flushRecordedAudioChunk();
+  resolveTranscriptionDrainIfReady();
+
+  if (transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
+    void syncTranscriptionProgress('draining');
+    return new Promise((resolve) => {
+      queueDrainResolve = resolve;
+      queueDrainTimeoutId = setTimeout(() => {
+        if (queueDrainResolve) {
+          resetCaptureSessionContext();
+          acceptedChunkCount = 0;
+          queueDrainResolve();
+          queueDrainResolve = null;
+          queueDrainTimeoutId = null;
+        }
+      }, 30000);
+    });
+  }
+
+  clearTimeout(queueDrainTimeoutId);
+  queueDrainTimeoutId = null;
+  resetCaptureSessionContext();
+  acceptedChunkCount = 0;
+  return Promise.resolve();
+}
+
+function pausePcmBatchTranscriptionCapture() {
+  isTranscribing = false;
+  resetAudioActivityHeartbeat();
+  clearTranscriptionChunkTimer();
+  disconnectTranscriptionProcessorNode();
+  flushTranscriptionChunk({ force: true });
+  resolveTranscriptionDrainIfReady();
+}
+
+function startBatchTranscriptionCapture() {
+  batchTranscriptionMode = batchCaptureRequiresPCM() ? 'pcm' : 'media-recorder';
+
+  if (batchTranscriptionMode === 'pcm') {
+    startTranscriptionCapture();
+    return;
+  }
+
+  startMediaRecorderBatchTranscriptionCapture();
+}
+
+function pauseBatchTranscriptionCapture() {
+  if (batchTranscriptionMode === 'pcm') {
+    pausePcmBatchTranscriptionCapture();
+    return;
+  }
+
+  pauseMediaRecorderBatchTranscriptionCapture();
+}
+
+async function stopBatchTranscriptionCapture() {
+  const mode = batchTranscriptionMode;
+  batchTranscriptionMode = null;
+
+  if (mode === 'pcm') {
+    return stopTranscriptionCapture();
+  }
+
+  return stopMediaRecorderBatchTranscriptionCapture();
 }
 
 // ── Serialized transcription queue ──
@@ -950,19 +1119,8 @@ function stopTranscriptionCapture() {
   // Stop/pause must silence future heartbeats before queue draining and media teardown begin.
   resetAudioActivityHeartbeat();
 
-  clearInterval(transcriptionChunkTimerId);
-  transcriptionChunkTimerId = null;
-
-  if (transcriptionProcessorNode) {
-    if (mediaStreamSource && typeof mediaStreamSource.disconnect === 'function') {
-      mediaStreamSource.disconnect(transcriptionProcessorNode);
-    }
-    if (typeof transcriptionProcessorNode.disconnect === 'function') {
-      transcriptionProcessorNode.disconnect();
-    }
-    transcriptionProcessorNode.onaudioprocess = null;
-    transcriptionProcessorNode = null;
-  }
+  clearTranscriptionChunkTimer();
+  disconnectTranscriptionProcessorNode();
 
   flushTranscriptionChunk({ force: true });
   resolveTranscriptionDrainIfReady();

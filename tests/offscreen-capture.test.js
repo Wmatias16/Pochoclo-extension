@@ -214,6 +214,17 @@ class FakeMediaRecorder {
     }
   }
 
+  emitChunk(body = LARGE_CHUNK_BODY, type = 'audio/webm;codecs=opus') {
+    if (typeof this.ondataavailable !== 'function') {
+      return;
+    }
+
+    this.chunkCounter += 1;
+    this.ondataavailable({
+      data: new Blob([`${body}-${this.chunkCounter}`], { type })
+    });
+  }
+
   stop() {
     if (this.state === 'inactive') {
       return;
@@ -253,7 +264,7 @@ class FakeMediaRecorder {
   }
 }
 
-test('offscreen capture keeps emitting chunks while the first background response is still pending', async () => {
+test('offscreen batch capture keeps queueing MediaRecorder chunks while the first background response is still pending', async () => {
   let firstChunkRelease;
   let processChunkCalls = 0;
   let enqueueCount = 0;
@@ -288,6 +299,7 @@ test('offscreen capture keeps emitting chunks while the first background respons
     navigator: global.navigator,
     AudioContext: global.AudioContext,
     MediaRecorder: global.MediaRecorder,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
     PochoclaOffscreenBridge: global.PochoclaOffscreenBridge
   };
@@ -308,6 +320,11 @@ test('offscreen capture keeps emitting chunks while the first background respons
   });
   setGlobalValue('AudioContext', FakeAudioContext);
   setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { liveAudioFormat: null, requiresPCM: false };
+    }
+  });
   setGlobalValue('PochoclaChunkProcessor', trackingChunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
 
@@ -329,21 +346,19 @@ test('offscreen capture keeps emitting chunks while the first background respons
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
     const audioContext = FakeAudioContext.instances[0];
-    await waitFor(() => audioContext.processorNodes.length > 0, 100);
-    const processorNode = audioContext.processorNodes[0];
-    const loudSamples = [0.25, -0.2, 0.15, -0.1, 0.05, -0.04, 0.03, -0.02];
-    for (let index = 0; index < 12; index += 1) {
-      processorNode.emitAudio(loudSamples);
-      await wait(5);
-    }
+    assert.equal(audioContext.processorNodes.length, 0);
+
+    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    assert.equal(!!sessionRecorder, true);
+
+    sessionRecorder.emitChunk('batch-pending-1');
+    await wait(30);
+    sessionRecorder.emitChunk('batch-pending-2');
 
     await waitFor(() => enqueueCount >= 2, 600);
 
     assert.equal(processChunkCalls, 1);
     assert.equal(enqueueCount >= 2, true);
-
-    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
-    assert.equal(!!sessionRecorder, true);
 
     firstChunkRelease();
 
@@ -361,7 +376,7 @@ test('offscreen capture keeps emitting chunks while the first background respons
   }
 });
 
-test('offscreen throttles audioActivity heartbeats and resets them across pause/resume', async () => {
+test('offscreen batch capture stays on MediaRecorder/WebM through pause/resume without ScriptProcessorNode heartbeats', async () => {
   const sentMessages = [];
   const chrome = createChromeForOffscreen({
     onProcessChunk: async () => ({ ok: true })
@@ -377,6 +392,7 @@ test('offscreen throttles audioActivity heartbeats and resets them across pause/
     navigator: global.navigator,
     AudioContext: global.AudioContext,
     MediaRecorder: global.MediaRecorder,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
     PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
     DateNow: Date.now
@@ -399,6 +415,11 @@ test('offscreen throttles audioActivity heartbeats and resets them across pause/
   });
   setGlobalValue('AudioContext', FakeAudioContext);
   setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { liveAudioFormat: null, requiresPCM: false };
+    }
+  });
   setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
   Date.now = () => nowValue;
@@ -420,46 +441,34 @@ test('offscreen throttles audioActivity heartbeats and resets them across pause/
     assert.equal(started.ok, true);
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
-    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
-    const loudSamples = [0.2, -0.18, 0.15, -0.1];
+    assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
 
-    processorNode.emitAudio(loudSamples);
-    nowValue += 500;
-    processorNode.emitAudio(loudSamples);
-    nowValue += 2_600;
-    processorNode.emitAudio(loudSamples);
-
-    const heartbeatsBeforePause = sentMessages.filter(
-      (message) => message && message.target === 'background' && message.action === 'audioActivity'
-    );
-    assert.equal(heartbeatsBeforePause.length, 2);
-    assert.deepEqual(
-      heartbeatsBeforePause.map((message) => message.at),
-      [1_000, 4_100]
-    );
+    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    assert.equal(!!sessionRecorder, true);
+    sessionRecorder.emitChunk('batch-before-pause');
+    await wait(30);
 
     const paused = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'pause' });
     assert.equal(paused.ok, true);
 
-    nowValue += 300;
-    processorNode.emitAudio(loudSamples);
-    assert.equal(
-      sentMessages.filter((message) => message && message.target === 'background' && message.action === 'audioActivity').length,
-      2
-    );
+    sessionRecorder.emitChunk('ignored-while-paused');
+    await wait(30);
 
     const resumed = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'resume' });
     assert.equal(resumed.ok, true);
+    assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
 
     nowValue += 200;
-    const resumedProcessorNode = FakeAudioContext.instances[0].processorNodes.at(-1);
-    resumedProcessorNode.emitAudio(loudSamples);
+    sessionRecorder.emitChunk('batch-after-resume');
+    await waitFor(
+      () => sentMessages.filter((message) => message && message.target === 'background' && message.action === 'processChunk').length >= 2,
+      500
+    );
 
-    const heartbeatsAfterResume = sentMessages.filter(
+    const heartbeats = sentMessages.filter(
       (message) => message && message.target === 'background' && message.action === 'audioActivity'
     );
-    assert.equal(heartbeatsAfterResume.length, 3);
-    assert.equal(heartbeatsAfterResume[2].at, 4_600);
+    assert.equal(heartbeats.length, 0);
 
     const stopped = await chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -477,28 +486,21 @@ test('offscreen throttles audioActivity heartbeats and resets them across pause/
   }
 });
 
-test('offscreen uses RMS threshold so isolated spikes do not count as activity', async () => {
-  const sentMessages = [];
+test('offscreen only enables batch PCM capture behind an explicit pcm16 provider capability gate', async () => {
   const chrome = createChromeForOffscreen({
     onProcessChunk: async () => ({ ok: true })
   });
-  const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
-  chrome.runtime.sendMessage = (message, callback) => {
-    sentMessages.push(message);
-    return originalSendMessage(message, callback);
-  };
 
   const originals = {
     chrome: global.chrome,
     navigator: global.navigator,
     AudioContext: global.AudioContext,
     MediaRecorder: global.MediaRecorder,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
-    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge,
-    DateNow: Date.now
+    PochoclaOffscreenBridge: global.PochoclaOffscreenBridge
   };
 
-  let nowValue = 9_000;
   FakeMediaRecorder.instances = [];
   FakeAudioContext.instances = [];
   setGlobalValue('chrome', chrome);
@@ -515,9 +517,13 @@ test('offscreen uses RMS threshold so isolated spikes do not count as activity',
   });
   setGlobalValue('AudioContext', FakeAudioContext);
   setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { liveAudioFormat: 'pcm16', requiresPCM: false };
+    }
+  });
   setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
-  Date.now = () => nowValue;
 
   delete require.cache[require.resolve(OFFSCREEN_PATH)];
   require(OFFSCREEN_PATH);
@@ -529,6 +535,7 @@ test('offscreen uses RMS threshold so isolated spikes do not count as activity',
       streamId: 'stream-rms',
       sessionContext: {
         sessionId: 'session-rms',
+        activeProvider: 'openai',
         chunkIntervalMs: 20
       }
     });
@@ -536,24 +543,9 @@ test('offscreen uses RMS threshold so isolated spikes do not count as activity',
     assert.equal(started.ok, true);
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
-    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
-
-    processorNode.emitAudio([0.14, 0, 0, 0, 0, 0, 0, 0]);
-    processorNode.emitAudio([0.13, 0, 0, 0, 0, 0, 0, 0]);
-
-    const spikeHeartbeats = sentMessages.filter(
-      (message) => message && message.target === 'background' && message.action === 'audioActivity'
-    );
-    assert.equal(spikeHeartbeats.length, 0);
-
-    nowValue += 3_000;
-    processorNode.emitAudio([0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]);
-
-    const rmsHeartbeats = sentMessages.filter(
-      (message) => message && message.target === 'background' && message.action === 'audioActivity'
-    );
-    assert.equal(rmsHeartbeats.length, 1);
-    assert.equal(rmsHeartbeats[0].at, 12_000);
+    assert.equal(FakeAudioContext.instances[0].processorNodes.length > 0, true);
+    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    assert.equal(!!sessionRecorder, true);
 
     const stopped = await chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -562,16 +554,13 @@ test('offscreen uses RMS threshold so isolated spikes do not count as activity',
     assert.deepEqual(stopped, { ok: true });
   } finally {
     delete require.cache[require.resolve(OFFSCREEN_PATH)];
-    Date.now = originals.DateNow;
-    Object.entries(originals)
-      .filter(([key]) => key !== 'DateNow')
-      .forEach(([key, value]) => {
-        setGlobalValue(key, value);
-      });
+    Object.entries(originals).forEach(([key, value]) => {
+      setGlobalValue(key, value);
+    });
   }
 });
 
-test('offscreen syncs accepted chunk totals and keeps draining progress visible after stop without counting silent chunks', async () => {
+test('offscreen syncs accepted batch chunk totals from recorded blobs and keeps draining progress visible after stop', async () => {
   const sentMessages = [];
   let processChunkCalls = 0;
   const chrome = createChromeForOffscreen({
@@ -600,6 +589,7 @@ test('offscreen syncs accepted chunk totals and keeps draining progress visible 
     navigator: global.navigator,
     AudioContext: global.AudioContext,
     MediaRecorder: global.MediaRecorder,
+    PochoclaProviderRegistry: global.PochoclaProviderRegistry,
     PochoclaChunkProcessor: global.PochoclaChunkProcessor,
     PochoclaOffscreenBridge: global.PochoclaOffscreenBridge
   };
@@ -620,6 +610,11 @@ test('offscreen syncs accepted chunk totals and keeps draining progress visible 
   });
   setGlobalValue('AudioContext', FakeAudioContext);
   setGlobalValue('MediaRecorder', FakeMediaRecorder);
+  setGlobalValue('PochoclaProviderRegistry', {
+    getProviderDefinition() {
+      return { liveAudioFormat: null, requiresPCM: false };
+    }
+  });
   setGlobalValue('PochoclaChunkProcessor', chunkProcessor);
   setGlobalValue('PochoclaOffscreenBridge', offscreenBridge);
 
@@ -639,18 +634,20 @@ test('offscreen syncs accepted chunk totals and keeps draining progress visible 
     assert.equal(started.ok, true);
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
-    const processorNode = FakeAudioContext.instances[0].processorNodes[0];
+    assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
+    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    assert.equal(!!sessionRecorder, true);
 
-    processorNode.emitAudio([0, 0, 0, 0, 0, 0, 0, 0]);
+    sessionRecorder.ondataavailable({ data: new Blob([''], { type: 'audio/webm;codecs=opus' }) });
     await wait(30);
     assert.equal(
       sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length,
       0
     );
 
-    processorNode.emitAudio([0.2, -0.18, 0.15, -0.1, 0.08, -0.06, 0.04, -0.02]);
+    sessionRecorder.emitChunk('batch-progress-1');
     await wait(30);
-    processorNode.emitAudio([0.22, -0.2, 0.16, -0.1, 0.07, -0.05, 0.03, -0.02]);
+    sessionRecorder.emitChunk('batch-progress-2');
     await waitFor(
       () => sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length >= 2,
       500
@@ -824,7 +821,7 @@ test('offscreen starts and stops live capture with MediaRecorder streaming blobs
   }
 });
 
-test('offscreen promoteBatchFallback stops live pipeline and resumes chunk capture without tearing shared media down', async () => {
+test('offscreen promoteBatchFallback stops live pipeline and resumes MediaRecorder batch capture without tearing shared media down', async () => {
   const sentMessages = [];
   let processChunkCalls = 0;
 
@@ -949,10 +946,11 @@ test('offscreen promoteBatchFallback stops live pipeline and resumes chunk captu
     assert.equal(promoted.ok, true);
     assert.equal(stopCalls, 1);
     assert.equal(flushCalls >= 1, true);
-    assert.equal(audioContext.processorNodes.length >= 2, true);
+    assert.equal(audioContext.processorNodes.length, 1);
 
-    const chunkProcessorNode = audioContext.processorNodes.at(-1);
-    chunkProcessorNode.emitAudio([0.2, -0.18, 0.15, -0.1, 0.08, -0.05, 0.03, -0.02]);
+    const batchRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    assert.equal(!!batchRecorder, true);
+    batchRecorder.emitChunk('fallback-batch');
     await waitFor(() => processChunkCalls >= 1, 500);
 
     assert.equal(

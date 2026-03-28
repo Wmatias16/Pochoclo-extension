@@ -44,7 +44,7 @@ test('default provider flow uses background/offscreen messaging and saves resolv
   assert.equal(chunkResult.providerId, 'deepgram');
 
   const liveTranscript = await harness.getTranscript();
-  assert.equal(liveTranscript.final, 'hola deepgram ');
+  assert.equal(liveTranscript.final, 'hola deepgram');
 
   const stopped = await harness.stopCapture();
   assert.equal(stopped.ok, true);
@@ -516,7 +516,7 @@ test('complete live happy path persists final transcript, interim updates, and l
     text: 'hola parcial final',
     at: 3
   });
-  assert.equal(final.liveTranscript.final, 'hola parcial final ');
+  assert.equal(final.liveTranscript.final, 'hola parcial final');
   assert.equal(final.liveTranscript.interim, '');
 
   await background.handleLiveClose({ action: 'liveClose', sessionId: started.transcriptSession.id, providerId: 'deepgram', at: 4 });
@@ -587,13 +587,13 @@ test('reconnect exhaustion falls back to batch without duplicating live finals',
     body: 'batch-audio'
   });
   assert.equal(chunkResult.ok, true);
-  assert.equal((await harness.getTranscript()).final, 'segmento live batch continua ');
+  assert.equal((await harness.getTranscript()).final, 'segmento live\nbatch continua');
 
   const stopped = await harness.stopCapture();
   assert.equal(stopped.ok, true);
 
   const saved = await harness.getSavedTranscriptions();
-  assert.equal(saved[0].text, 'segmento live batch continua');
+  assert.equal(saved[0].text, 'segmento live\nbatch continua');
   assert.deepEqual(saved[0].providerAttribution, ['deepgram-live', 'deepgram-batch']);
   assert.equal(saved[0].fallbackReason, 'reconnect_exhausted');
   assert.equal(saved[0].terminalStatus, 'fallback-to-batch');

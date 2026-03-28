@@ -399,6 +399,28 @@
       font-style: italic;
     }
 
+    .transcript-segment,
+    .detail-segment {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .transcript-segment:last-child,
+    .detail-segment:last-child {
+      margin-bottom: 0;
+    }
+
+    .transcript-text {
+      color: inherit;
+    }
+
+    .transcript-timestamp {
+      color: rgba(75, 85, 99, 0.62);
+      font-size: 0.85em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+      white-space: nowrap;
+    }
+
     /* Settings */
     .header-right {
       display: flex;
@@ -1160,6 +1182,9 @@
       margin-bottom: 16px;
       white-space: pre-wrap;
     }
+    .detail-segment {
+      line-height: 1.7;
+    }
     .detail-text-box::-webkit-scrollbar { width: 4px; }
     .detail-text-box::-webkit-scrollbar-track { background: transparent; }
     .detail-text-box::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
@@ -1340,7 +1365,7 @@
       <div class="transcript-placeholder" id="placeholder">
         La transcripción aparecerá aquí...
       </div>
-      <span id="transcriptText"></span>
+      <div id="transcriptText"></div>
     </div>
   </div>
 

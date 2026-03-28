@@ -30,7 +30,85 @@
   }
 
   function normalizeTimestamp(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
     return Number.isFinite(Number(value)) ? Number(value) : null;
+  }
+
+  function padTimestampUnit(value) {
+    return String(value).padStart(2, '0');
+  }
+
+  function formatTranscriptTimestamp(seconds) {
+    if (seconds === null || seconds === undefined) {
+      return null;
+    }
+
+    const numericSeconds = Number(seconds);
+    if (!Number.isFinite(numericSeconds)) {
+      return null;
+    }
+
+    const safeSeconds = Math.max(0, Math.floor(numericSeconds));
+    const hours = Math.floor(safeSeconds / 3600);
+    const minutes = Math.floor((safeSeconds % 3600) / 60);
+    const remainingSeconds = safeSeconds % 60;
+
+    if (hours >= 1) {
+      return `[${hours}:${padTimestampUnit(minutes)}:${padTimestampUnit(remainingSeconds)}]`;
+    }
+
+    return `[${padTimestampUnit(minutes)}m ${padTimestampUnit(remainingSeconds)}s]`;
+  }
+
+  function normalizeTranscriptSegment(segment) {
+    if (!segment || typeof segment !== 'object') {
+      return null;
+    }
+
+    const text = typeof segment.text === 'string' ? segment.text : '';
+    const timestampSec = normalizeTimestamp(segment.timestampSec);
+    const timestampLabel = hasText(segment.timestampLabel)
+      ? segment.timestampLabel.trim()
+      : formatTranscriptTimestamp(timestampSec);
+
+    return {
+      text,
+      timestampSec,
+      timestampLabel
+    };
+  }
+
+  function normalizeTranscriptSegments(segments) {
+    if (!Array.isArray(segments)) {
+      return [];
+    }
+
+    return segments
+      .map(normalizeTranscriptSegment)
+      .filter(Boolean);
+  }
+
+  function buildTranscriptTextFromSegments(segments) {
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return '';
+    }
+
+    return segments
+      .map((segment) => {
+        const normalizedSegment = normalizeTranscriptSegment(segment);
+        if (!normalizedSegment) {
+          return '';
+        }
+
+        const text = normalizedSegment.text;
+        const timestampLabel = normalizedSegment.timestampLabel;
+        return timestampLabel ? `${text} ${timestampLabel}`.trim() : text;
+      })
+      .filter((segmentText) => typeof segmentText === 'string' && segmentText.length > 0)
+      .join('\n');
   }
 
   function normalizeProviderAttribution(value, fallbackProvider) {
@@ -92,10 +170,17 @@
   }
 
   function normalizeTranscription(record = {}, defaultMode = 'batch') {
-    const text = typeof record.text === 'string'
+    const sourceText = typeof record.text === 'string'
       ? record.text
       : (typeof record.final === 'string' ? record.final : '');
-    const final = typeof record.final === 'string' ? record.final : text;
+    const segments = normalizeTranscriptSegments(record.segments);
+    const derivedText = segments.length > 0
+      ? buildTranscriptTextFromSegments(segments)
+      : null;
+    const text = derivedText !== null ? derivedText : sourceText;
+    const final = derivedText !== null
+      ? derivedText
+      : (typeof record.final === 'string' ? record.final : text);
     const mode = normalizeMode(record.mode, defaultMode);
     const reconnectCount = normalizeCount(
       record.reconnectCount,
@@ -105,6 +190,7 @@
     return {
       text,
       final,
+      segments,
       interim: typeof record.interim === 'string' ? record.interim : '',
       mode,
       fallbackReason: hasText(record.fallbackReason) ? record.fallbackReason.trim() : null,
@@ -400,7 +486,8 @@
       return {
         text: currentLiveTranscript.text || '',
         interim: currentLiveTranscript.interim || '',
-        mode: currentLiveTranscript.mode || 'batch'
+        mode: currentLiveTranscript.mode || 'batch',
+        segments: normalizeTranscriptSegments(currentLiveTranscript.segments)
       };
     }
 
@@ -434,6 +521,9 @@
       text: transcript.text,
       interim: transcript.interim,
       mode: transcript.mode,
+      segments: Array.isArray(transcript.segments)
+        ? transcript.segments.map((segment) => ({ ...segment }))
+        : [],
       sessionId: transcriptSession.id,
       final: transcript.final,
       fallbackReason: transcript.fallbackReason,
@@ -447,7 +537,9 @@
   }
 
   return {
+    buildTranscriptTextFromSegments,
     createProviderAuditSnapshot,
+    formatTranscriptTimestamp,
     getLiveTranscript,
     normalizeProviderAudit,
     normalizeTranscription,

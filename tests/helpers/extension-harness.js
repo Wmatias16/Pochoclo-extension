@@ -106,7 +106,7 @@ function createStorageArea(initial = {}) {
   };
 }
 
-function createChromeMock(storageArea) {
+function createChromeMock(storageArea, options = {}) {
   const runtimeListeners = [];
   const alarmListeners = [];
   const notificationButtonListeners = [];
@@ -295,6 +295,10 @@ function createChromeMock(storageArea) {
     tabs: {
       async sendMessage(tabId, message) {
         tabMessages.push({ tabId, message: cloneMessage(message) });
+        if (typeof options.tabSendMessage === 'function') {
+          return options.tabSendMessage(tabId, cloneMessage(message));
+        }
+
         return { ok: true };
       }
     },
@@ -546,7 +550,7 @@ function createHarness(options = {}) {
     audioLanguage: 'es',
     ...(options.initialStorage || {})
   });
-  const chrome = createChromeMock(storageArea);
+  const chrome = createChromeMock(storageArea, options);
   const fetchImpl = options.fetchImpl || (async (url) => {
     if (typeof options.fetchResponseForUrl === 'function') {
       return options.fetchResponseForUrl(url);

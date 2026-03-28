@@ -2,12 +2,45 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildTranscriptTextFromSegments,
   createProviderAuditSnapshot,
+  formatTranscriptTimestamp,
   getLiveTranscript,
   normalizeTranscription,
   normalizeSavedTranscription,
   normalizeSavedTranscriptions
 } = require('../storage/transcriptions.js');
+
+test('formatTranscriptTimestamp handles edge cases and hour rollover', () => {
+  assert.equal(formatTranscriptTimestamp(0), '[00m 00s]');
+  assert.equal(formatTranscriptTimestamp(59), '[00m 59s]');
+  assert.equal(formatTranscriptTimestamp(60), '[01m 00s]');
+  assert.equal(formatTranscriptTimestamp(3599), '[59m 59s]');
+  assert.equal(formatTranscriptTimestamp(3600), '[1:00:00]');
+  assert.equal(formatTranscriptTimestamp(7261), '[2:01:01]');
+  assert.equal(formatTranscriptTimestamp(null), null);
+  assert.equal(formatTranscriptTimestamp(undefined), null);
+  assert.equal(formatTranscriptTimestamp(-5), '[00m 00s]');
+});
+
+test('buildTranscriptTextFromSegments renders mixed labeled and unlabeled segments', () => {
+  const text = buildTranscriptTextFromSegments([
+    { text: 'Hola como estas', timestampLabel: '[00m 20s]' },
+    { text: 'Seguimos sin etiqueta', timestampLabel: null },
+    { text: 'Otro texto', timestampLabel: '[01m 05s]' }
+  ]);
+
+  assert.equal(text, 'Hola como estas [00m 20s]\nSeguimos sin etiqueta\nOtro texto [01m 05s]');
+});
+
+test('buildTranscriptTextFromSegments derives labels from timestampSec when missing', () => {
+  const text = buildTranscriptTextFromSegments([
+    { text: 'Inicio', timestampSec: 59, timestampLabel: null },
+    { text: 'Sin tiempo', timestampSec: null, timestampLabel: null }
+  ]);
+
+  assert.equal(text, 'Inicio [00m 59s]\nSin tiempo');
+});
 
 test('createProviderAuditSnapshot preserves runtime audit fields for history entries', () => {
   const snapshot = createProviderAuditSnapshot({
@@ -61,8 +94,64 @@ test('normalizeSavedTranscription keeps backward compatibility for legacy openai
 
   assert.equal(normalized.resolvedProvider, 'openai');
   assert.equal(normalized.status, 'completed');
+  assert.deepEqual(normalized.segments, []);
   assert.equal(normalized.providerAudit, null);
   assert.equal(normalized.summary, null);
+});
+
+test('normalizeSavedTranscription keeps legacy history text intact when segments are missing', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_legacy_history',
+    title: 'Historial legacy',
+    text: 'texto legacy completo',
+    final: 'texto legacy completo',
+    date: 123,
+    duration: 18,
+    language: 'es'
+  });
+
+  assert.equal(normalized.text, 'texto legacy completo');
+  assert.equal(normalized.final, 'texto legacy completo');
+  assert.deepEqual(normalized.segments, []);
+});
+
+test('normalizeSavedTranscription derives flat text from persisted segments', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_segments',
+    title: 'Con timestamps',
+    segments: [
+      { text: 'Hola', timestampSec: 20, timestampLabel: '[00m 20s]' },
+      { text: 'Otro texto', timestampSec: 65, timestampLabel: '[01m 05s]' }
+    ]
+  });
+
+  assert.equal(normalized.text, 'Hola [00m 20s]\nOtro texto [01m 05s]');
+  assert.equal(normalized.final, 'Hola [00m 20s]\nOtro texto [01m 05s]');
+  assert.deepEqual(normalized.segments, [
+    { text: 'Hola', timestampSec: 20, timestampLabel: '[00m 20s]' },
+    { text: 'Otro texto', timestampSec: 65, timestampLabel: '[01m 05s]' }
+  ]);
+});
+
+test('normalizeSavedTranscription builds flat text from mixed labeled and unlabeled segments', () => {
+  const normalized = normalizeSavedTranscription({
+    id: 'tx_mixed_segments',
+    title: 'Mixto',
+    text: 'texto a reemplazar',
+    segments: [
+      { text: 'Con etiqueta', timestampSec: 20, timestampLabel: '[00m 20s]' },
+      { text: 'Sin etiqueta', timestampSec: null, timestampLabel: null },
+      { text: 'Etiqueta derivada', timestampSec: 65, timestampLabel: '' }
+    ]
+  });
+
+  assert.equal(normalized.text, 'Con etiqueta [00m 20s]\nSin etiqueta\nEtiqueta derivada [01m 05s]');
+  assert.equal(normalized.final, 'Con etiqueta [00m 20s]\nSin etiqueta\nEtiqueta derivada [01m 05s]');
+  assert.deepEqual(normalized.segments, [
+    { text: 'Con etiqueta', timestampSec: 20, timestampLabel: '[00m 20s]' },
+    { text: 'Sin etiqueta', timestampSec: null, timestampLabel: null },
+    { text: 'Etiqueta derivada', timestampSec: 65, timestampLabel: '[01m 05s]' }
+  ]);
 });
 
 test('normalizeSavedTranscription preserves a valid persisted summary payload', () => {
@@ -223,6 +312,7 @@ test('normalizeTranscription preserves explicit values for new live transcript f
   assert.deepEqual(normalized, {
     text: 'hola final',
     final: 'hola final',
+    segments: [],
     interim: ' hola parcial ',
     mode: 'live',
     fallbackReason: 'reconnect_exhausted',
@@ -289,7 +379,10 @@ test('getLiveTranscript returns active current live transcript for matching sess
             sessionId: 'session-live',
             text: 'hola final ',
             interim: 'hola interina',
-            mode: 'live'
+            mode: 'live',
+            segments: [
+              { text: 'hola final', timestampSec: 20, timestampLabel: '[00m 20s]' }
+            ]
           }
         };
       }
@@ -303,7 +396,10 @@ test('getLiveTranscript returns active current live transcript for matching sess
   assert.deepEqual(liveTranscript, {
     text: 'hola final ',
     interim: 'hola interina',
-    mode: 'live'
+    mode: 'live',
+    segments: [
+      { text: 'hola final', timestampSec: 20, timestampLabel: '[00m 20s]' }
+    ]
   });
 });
 
@@ -350,6 +446,7 @@ test('normalizeTranscription includes new live transcript fields with defaults',
   assert.deepEqual(normalized, {
     text: 'texto base',
     final: 'texto base',
+    segments: [],
     interim: '',
     mode: 'batch',
     fallbackReason: null,
@@ -379,6 +476,7 @@ test('normalizeTranscription preserves explicit values for new fields', () => {
 
   assert.equal(normalized.text, 'texto base');
   assert.equal(normalized.final, 'texto base');
+  assert.deepEqual(normalized.segments, []);
   assert.equal(normalized.interim, 'texto parcial');
   assert.equal(normalized.mode, 'live');
   assert.equal(normalized.fallbackReason, 'reconnect_exhausted');
@@ -391,4 +489,23 @@ test('normalizeTranscription preserves explicit values for new fields', () => {
   assert.equal(normalized.reconnectCount, 2);
   assert.equal(normalized.terminalStatus, 'fallback-to-batch');
   assert.deepEqual(normalized.providerAttribution, ['deepgram-live', 'deepgram-batch']);
+});
+
+test('normalizeTranscription derives flat text from segments and fills missing labels', () => {
+  const normalized = normalizeTranscription({
+    text: 'texto legacy que debe ser reemplazado',
+    segments: [
+      { text: 'Hola', timestampSec: 0, timestampLabel: null },
+      { text: 'Sin marca', timestampSec: null, timestampLabel: null },
+      { text: 'Largo', timestampSec: 3600, timestampLabel: null }
+    ]
+  });
+
+  assert.equal(normalized.text, 'Hola [00m 00s]\nSin marca\nLargo [1:00:00]');
+  assert.equal(normalized.final, 'Hola [00m 00s]\nSin marca\nLargo [1:00:00]');
+  assert.deepEqual(normalized.segments, [
+    { text: 'Hola', timestampSec: 0, timestampLabel: '[00m 00s]' },
+    { text: 'Sin marca', timestampSec: null, timestampLabel: null },
+    { text: 'Largo', timestampSec: 3600, timestampLabel: '[1:00:00]' }
+  ]);
 });

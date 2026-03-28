@@ -8,10 +8,11 @@
   root.PochocloRecordingIndicator = api;
 
   if (root && root.document && root.chrome && root.chrome.runtime) {
-    api.initRecordingIndicator();
+    api.initContentScript();
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   const INDICATOR_HOST_ID = 'pochoclo-recording-indicator';
+  const VIDEO_SELECTOR_HEURISTIC = Object.freeze(['playing', 'visible', 'largest', 'mostRecent']);
   // The manifest injects this script on <all_urls> so the floating indicator can appear on whichever
   // tab the user chooses to record. Actual UI rendering still stays gated by background recording state.
   // Open shadow root keeps the floating indicator isolated from page CSS while remaining testable/debuggable.
@@ -63,6 +64,312 @@
     }
 
     return Promise.resolve(undefined);
+  }
+
+  function toFiniteNumber(value) {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue : null;
+  }
+
+  function readVideoDimensions(videoElement) {
+    if (!videoElement) {
+      return { width: 0, height: 0 };
+    }
+
+    if (typeof videoElement.getBoundingClientRect === 'function') {
+      const rect = videoElement.getBoundingClientRect();
+      const width = Math.max(0, Number(rect && rect.width) || 0);
+      const height = Math.max(0, Number(rect && rect.height) || 0);
+      return { width, height };
+    }
+
+    const width = Math.max(0, Number(videoElement.clientWidth || videoElement.width || videoElement.videoWidth) || 0);
+    const height = Math.max(0, Number(videoElement.clientHeight || videoElement.height || videoElement.videoHeight) || 0);
+    return { width, height };
+  }
+
+  function isVideoVisible(videoElement, dimensions) {
+    if (!videoElement) {
+      return false;
+    }
+
+    const style = videoElement.style || {};
+    if (videoElement.hidden || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+      return false;
+    }
+
+    return Number(dimensions && dimensions.width) > 0 && Number(dimensions && dimensions.height) > 0;
+  }
+
+  function buildVideoCandidateMeta(videoElement, previousMeta, fallbackToken) {
+    const dimensions = readVideoDimensions(videoElement);
+    const width = dimensions.width;
+    const height = dimensions.height;
+    const paused = !!videoElement.paused;
+    const playing = !paused && !videoElement.ended;
+    const visible = isVideoVisible(videoElement, dimensions);
+
+    return {
+      element: videoElement,
+      paused,
+      playing,
+      visible,
+      width,
+      height,
+      area: width * height,
+      currentTimeSec: toFiniteNumber(videoElement.currentTime),
+      durationSec: toFiniteNumber(videoElement.duration),
+      lastUpdatedToken: previousMeta ? previousMeta.lastUpdatedToken : fallbackToken
+    };
+  }
+
+  function compareVideoCandidates(leftCandidate, rightCandidate) {
+    if (!!leftCandidate.playing !== !!rightCandidate.playing) {
+      return leftCandidate.playing ? -1 : 1;
+    }
+
+    if (!!leftCandidate.visible !== !!rightCandidate.visible) {
+      return leftCandidate.visible ? -1 : 1;
+    }
+
+    if ((leftCandidate.area || 0) !== (rightCandidate.area || 0)) {
+      return (rightCandidate.area || 0) - (leftCandidate.area || 0);
+    }
+
+    if ((leftCandidate.lastUpdatedToken || 0) !== (rightCandidate.lastUpdatedToken || 0)) {
+      return (rightCandidate.lastUpdatedToken || 0) - (leftCandidate.lastUpdatedToken || 0);
+    }
+
+    return 0;
+  }
+
+  function selectBestVideoCandidate(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+
+    return [...candidates].sort(compareVideoCandidates)[0] || null;
+  }
+
+  function collectVideoElements(documentRef) {
+    if (!documentRef) {
+      return [];
+    }
+
+    const discoveredVideos = [];
+    const visitedNodes = new Set();
+
+    function visit(node) {
+      if (!node || visitedNodes.has(node)) {
+        return;
+      }
+
+      visitedNodes.add(node);
+
+      if (String(node.tagName || '').toLowerCase() === 'video') {
+        discoveredVideos.push(node);
+      }
+
+      const children = Array.isArray(node.children) ? node.children : [];
+      children.forEach(visit);
+
+      if (node.shadowRoot) {
+        visit(node.shadowRoot);
+      }
+    }
+
+    visit(documentRef.documentElement);
+    if (documentRef.body) {
+      visit(documentRef.body);
+    }
+
+    return discoveredVideos;
+  }
+
+  function createActiveVideoTracker(deps = {}) {
+    const runtime = deps.runtime || (globalThis.chrome && globalThis.chrome.runtime) || null;
+    const documentRef = deps.document || globalThis.document || null;
+    const MutationObserverImpl = deps.MutationObserver || globalThis.MutationObserver || null;
+
+    let initialized = false;
+    let updateCounter = 0;
+    let mutationObserver = null;
+    let candidateMap = new Map();
+    const listenerRegistry = new Map();
+
+    function nextUpdateToken() {
+      updateCounter += 1;
+      return updateCounter;
+    }
+
+    function detachVideoListeners(videoElement) {
+      const registration = listenerRegistry.get(videoElement);
+      if (!registration) {
+        return;
+      }
+
+      if (typeof videoElement.removeEventListener === 'function') {
+        registration.events.forEach((eventName) => {
+          videoElement.removeEventListener(eventName, registration.handler);
+        });
+      }
+
+      listenerRegistry.delete(videoElement);
+    }
+
+    function touchVideoCandidate(videoElement) {
+      if (!candidateMap.has(videoElement)) {
+        refreshCandidates();
+        return;
+      }
+
+      const previousMeta = candidateMap.get(videoElement);
+      const nextMeta = buildVideoCandidateMeta(videoElement, previousMeta, previousMeta.lastUpdatedToken);
+      nextMeta.lastUpdatedToken = nextUpdateToken();
+      candidateMap.set(videoElement, nextMeta);
+    }
+
+    function attachVideoListeners(videoElement) {
+      if (!videoElement || listenerRegistry.has(videoElement) || typeof videoElement.addEventListener !== 'function') {
+        return;
+      }
+
+      const events = ['play', 'pause', 'playing', 'ended'];
+      const handler = () => {
+        touchVideoCandidate(videoElement);
+      };
+
+      events.forEach((eventName) => {
+        videoElement.addEventListener(eventName, handler);
+      });
+
+      listenerRegistry.set(videoElement, { events, handler });
+    }
+
+    function refreshCandidates() {
+      const discoveredVideos = collectVideoElements(documentRef);
+      const nextCandidateMap = new Map();
+
+      discoveredVideos.forEach((videoElement) => {
+        attachVideoListeners(videoElement);
+        const previousMeta = candidateMap.get(videoElement);
+        const nextMeta = buildVideoCandidateMeta(
+          videoElement,
+          previousMeta,
+          previousMeta ? previousMeta.lastUpdatedToken : nextUpdateToken()
+        );
+        nextCandidateMap.set(videoElement, nextMeta);
+      });
+
+      Array.from(candidateMap.keys()).forEach((videoElement) => {
+        if (!nextCandidateMap.has(videoElement)) {
+          detachVideoListeners(videoElement);
+        }
+      });
+
+      candidateMap = nextCandidateMap;
+      return getBestCandidate();
+    }
+
+    function getBestCandidate() {
+      return selectBestVideoCandidate(Array.from(candidateMap.values()));
+    }
+
+    function getActiveVideoSnapshot() {
+      refreshCandidates();
+      const bestCandidate = getBestCandidate();
+
+      if (!bestCandidate) {
+        return { hasVideo: false };
+      }
+
+      const snapshot = buildVideoCandidateMeta(
+        bestCandidate.element,
+        bestCandidate,
+        bestCandidate.lastUpdatedToken
+      );
+      snapshot.lastUpdatedToken = bestCandidate.lastUpdatedToken;
+      candidateMap.set(bestCandidate.element, snapshot);
+
+      return {
+        hasVideo: true,
+        currentTimeSec: snapshot.currentTimeSec,
+        durationSec: snapshot.durationSec,
+        paused: snapshot.paused
+      };
+    }
+
+    function handleRuntimeMessage(message, sender, sendResponse) {
+      if (!message || message.action !== 'getActiveVideoTime') {
+        return undefined;
+      }
+
+      const response = getActiveVideoSnapshot();
+      if (typeof sendResponse === 'function') {
+        sendResponse(response);
+        return true;
+      }
+
+      return response;
+    }
+
+    function init() {
+      if (initialized) {
+        return tracker;
+      }
+
+      initialized = true;
+      refreshCandidates();
+
+      if (MutationObserverImpl) {
+        const observerTarget = documentRef && (documentRef.documentElement || documentRef);
+        if (observerTarget) {
+          mutationObserver = new MutationObserverImpl(() => {
+            refreshCandidates();
+          });
+
+          if (typeof mutationObserver.observe === 'function') {
+            mutationObserver.observe(observerTarget, { childList: true, subtree: true });
+          }
+        }
+      }
+
+      if (runtime && runtime.onMessage && typeof runtime.onMessage.addListener === 'function') {
+        runtime.onMessage.addListener(handleRuntimeMessage);
+      }
+
+      return tracker;
+    }
+
+    function destroy() {
+      if (mutationObserver && typeof mutationObserver.disconnect === 'function') {
+        mutationObserver.disconnect();
+      }
+
+      mutationObserver = null;
+      Array.from(listenerRegistry.keys()).forEach(detachVideoListeners);
+      candidateMap.clear();
+      initialized = false;
+    }
+
+    function getCandidateSummaries() {
+      return Array.from(candidateMap.values());
+    }
+
+    const tracker = {
+      init,
+      destroy,
+      refreshCandidates,
+      getBestCandidate,
+      getActiveVideoSnapshot,
+      getCandidateSummaries,
+      handleRuntimeMessage,
+      getSelectorHeuristic() {
+        return [...VIDEO_SELECTOR_HEURISTIC];
+      }
+    };
+
+    return tracker;
   }
 
   function createRecordingIndicatorController(deps = {}) {
@@ -302,6 +609,7 @@
   }
 
   let activeController = null;
+  let activeVideoTracker = null;
 
   function initRecordingIndicator(deps = {}) {
     if (!activeController) {
@@ -312,11 +620,33 @@
     return activeController;
   }
 
+  function initVideoTracking(deps = {}) {
+    if (!activeVideoTracker) {
+      activeVideoTracker = createActiveVideoTracker(deps);
+      activeVideoTracker.init();
+    }
+
+    return activeVideoTracker;
+  }
+
+  function initContentScript(deps = {}) {
+    return {
+      recordingIndicator: initRecordingIndicator(deps),
+      videoTracker: initVideoTracking(deps)
+    };
+  }
+
   return {
     INDICATOR_HOST_ID,
+    VIDEO_SELECTOR_HEURISTIC,
     formatElapsedTime,
     sendRuntimeMessage,
+    compareVideoCandidates,
+    selectBestVideoCandidate,
+    createActiveVideoTracker,
     createRecordingIndicatorController,
-    initRecordingIndicator
+    initRecordingIndicator,
+    initVideoTracking,
+    initContentScript
   };
 });

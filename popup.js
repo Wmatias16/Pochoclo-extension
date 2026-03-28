@@ -170,6 +170,76 @@ function hasText(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function normalizeRenderableSegments(segments) {
+  if (!Array.isArray(segments)) {
+    return [];
+  }
+
+  return segments
+    .map((segment) => {
+      if (!segment || typeof segment !== 'object') {
+        return null;
+      }
+
+      const text = typeof segment.text === 'string' ? segment.text : '';
+      const timestampLabel = hasText(segment.timestampLabel) ? segment.timestampLabel.trim() : null;
+
+      if (!hasText(text) && !timestampLabel) {
+        return null;
+      }
+
+      return { text, timestampLabel };
+    })
+    .filter(Boolean);
+}
+
+function hasRenderableSegments(segments) {
+  return normalizeRenderableSegments(segments).length > 0;
+}
+
+function buildPlainTextFromSegments(segments) {
+  const renderableSegments = normalizeRenderableSegments(segments);
+  if (renderableSegments.length === 0) {
+    return '';
+  }
+
+  return renderableSegments
+    .map((segment) => segment.text)
+    .filter(hasText)
+    .join(' ')
+    .trim();
+}
+
+function createSegmentElement(segment, segmentClassName) {
+  const wrapper = document.createElement('span');
+  wrapper.classList.add(segmentClassName);
+
+  const textEl = document.createElement('span');
+  textEl.classList.add('transcript-text');
+  textEl.textContent = segment.text || '';
+  wrapper.appendChild(textEl);
+
+  if (hasText(segment.timestampLabel)) {
+    const timestampEl = document.createElement('span');
+    timestampEl.classList.add('transcript-timestamp');
+    timestampEl.textContent = ` ${segment.timestampLabel}`;
+    wrapper.appendChild(timestampEl);
+  }
+
+  return wrapper;
+}
+
+function renderSegmentCollection(container, segments, segmentClassName) {
+  const renderableSegments = normalizeRenderableSegments(segments);
+  container.textContent = '';
+
+  renderableSegments.forEach((segment) => {
+    container.appendChild(createSegmentElement(segment, segmentClassName));
+  });
+
+  return renderableSegments;
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
@@ -476,6 +546,11 @@ function getHistoryPreview(item) {
   const text = typeof item.text === 'string' ? item.text.trim() : '';
   if (text) {
     return text.length > 100 ? `${text.slice(0, 100)}…` : text;
+  }
+
+  const segmentText = buildPlainTextFromSegments(item && item.segments);
+  if (segmentText) {
+    return segmentText.length > 100 ? `${segmentText.slice(0, 100)}…` : segmentText;
   }
 
   const lastError = item && item.providerAudit && item.providerAudit.lastChunkError;
@@ -860,9 +935,12 @@ function applyUI(state) {
       const transcriptMode = liveTranscript
         ? (liveTranscript.mode || 'batch')
         : (transcript ? (transcript.mode || 'batch') : 'batch');
+      const transcriptSegments = liveTranscript
+        ? (Array.isArray(liveTranscript.segments) ? liveTranscript.segments : [])
+        : (transcript && Array.isArray(transcript.segments) ? transcript.segments : []);
 
       if (transcript || liveTranscript) {
-        updateTranscriptUI(finalText, interimText, transcriptMode);
+        updateTranscriptUI(finalText, interimText, transcriptMode, transcriptSegments);
       }
       transcriptInterval = setTimeout(pollTranscript, getTranscriptPollIntervalMs(liveSessionState));
     };
@@ -930,51 +1008,64 @@ function resetWaveBars() {
 
 // ── Transcript UI helpers ──
 let lastTranscriptLength = 0;
+let lastTranscriptRenderMode = 'flat';
 
-function updateTranscriptUI(finalText, interimText, mode = 'batch') {
-  placeholder.style.display = 'none';
-  const newFinal = finalText.slice(lastTranscriptLength);
-  if (newFinal) {
-    appendStreamText(newFinal);
+function updateTranscriptUI(finalText, interimText, mode = 'batch', segments = []) {
+  const renderableSegments = normalizeRenderableSegments(segments);
+  const shouldRenderSegments = renderableSegments.length > 0;
+
+  if (shouldRenderSegments) {
+    renderSegmentCollection(transcriptText, renderableSegments, 'transcript-segment');
     lastTranscriptLength = finalText.length;
+    lastTranscriptRenderMode = 'segments';
+  } else {
+    if (lastTranscriptRenderMode === 'segments' || finalText.length < lastTranscriptLength) {
+      transcriptText.textContent = '';
+      lastTranscriptLength = 0;
+    }
+
+    const newFinal = finalText.slice(lastTranscriptLength);
+    if (newFinal) {
+      appendStreamText(newFinal);
+      lastTranscriptLength = finalText.length;
+    } else if (!hasText(finalText)) {
+      transcriptText.textContent = '';
+      lastTranscriptLength = 0;
+    }
+
+    lastTranscriptRenderMode = 'flat';
   }
 
   let interimSpan = transcriptText.querySelector('.interim');
+  if (interimSpan) {
+    interimSpan.remove();
+    interimSpan = null;
+  }
+
   const shouldRenderInterim = mode === 'live' && hasText(interimText);
   if (shouldRenderInterim) {
-    if (!interimSpan) {
-      interimSpan = document.createElement('span');
-      interimSpan.classList.add('interim', 'transcript-interim');
-      transcriptText.appendChild(interimSpan);
-    }
+    interimSpan = document.createElement('span');
+    interimSpan.classList.add('interim', 'transcript-interim');
     interimSpan.textContent = ` ${interimText}`;
+    transcriptText.appendChild(interimSpan);
   } else if (interimSpan) {
     interimSpan.remove();
   }
 
-  if (finalText || shouldRenderInterim) {
+  if (hasText(finalText) || shouldRenderInterim || shouldRenderSegments) {
+    placeholder.style.display = 'none';
     btnCopy.disabled = false;
     transcriptBox.scrollTop = transcriptBox.scrollHeight;
+    return;
   }
+
+  placeholder.style.display = 'flex';
+  btnCopy.disabled = true;
 }
 
 function appendStreamText(text) {
-  const interim = transcriptText.querySelector('.interim');
-  if (interim) interim.remove();
-
-  let i = 0;
-  const typeNextChar = () => {
-    if (i >= text.length) {
-      if (interim) transcriptText.appendChild(interim);
-      return;
-    }
-    transcriptText.insertAdjacentText('beforeend', text[i]);
-    transcriptBox.scrollTop = transcriptBox.scrollHeight;
-    i += 1;
-    setTimeout(typeNextChar, 20);
-  };
-
-  typeNextChar();
+  transcriptText.insertAdjacentText('beforeend', text);
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
 }
 
 function clearTranscriptUI() {
@@ -982,6 +1073,7 @@ function clearTranscriptUI() {
   placeholder.style.display = 'flex';
   btnCopy.disabled = true;
   lastTranscriptLength = 0;
+  lastTranscriptRenderMode = 'flat';
 }
 
 function clearProgressUI() {
@@ -1160,15 +1252,15 @@ async function init() {
    const transcript = storageState && storageState.transcript;
    if (resolvedState.status === 'idle') {
      clearTranscriptUI();
-     } else if (transcript && (transcript.final || transcript.interim)) {
-       placeholder.style.display = 'none';
-       transcriptText.textContent = transcript.final || '';
-       lastTranscriptLength = (transcript.final || '').length;
-       if (transcript.interim) {
-         updateTranscriptUI(transcript.final || '', transcript.interim || '', transcript.mode || 'batch');
-       }
-       if (transcript.final || transcript.interim) btnCopy.disabled = false;
-     }
+      } else if (transcript && (transcript.final || transcript.interim || hasRenderableSegments(transcript.segments))) {
+        placeholder.style.display = 'none';
+        updateTranscriptUI(
+          transcript.final || '',
+          transcript.interim || '',
+          transcript.mode || 'batch',
+          Array.isArray(transcript.segments) ? transcript.segments : []
+        );
+      }
 
   const audioLanguage = storageState && storageState.audioLanguage;
   if (audioLanguage) {
@@ -1412,7 +1504,11 @@ function openDetail(item) {
 
   detailUrl.textContent = hostname;
   detailUrl.style.display = hostname ? 'block' : 'none';
-  detailText.textContent = item.text || 'La transcripción no generó texto final.';
+  if (hasRenderableSegments(item && item.segments)) {
+    renderSegmentCollection(detailText, item.segments, 'detail-segment');
+  } else {
+    detailText.textContent = item.text || 'La transcripción no generó texto final.';
+  }
   renderDetailSummary(currentDetailItem);
   renderAuditDetail(item);
   showView('detail');

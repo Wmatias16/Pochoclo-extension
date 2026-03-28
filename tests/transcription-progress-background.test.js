@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { setTimeout: nativeSetTimeout, clearTimeout: nativeClearTimeout } = require('node:timers');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const { buildDefaultProviderSettings } = require('../storage/settings.js');
@@ -166,6 +167,140 @@ test('background counts successful and failed terminal chunk outcomes as complet
   assert.equal('transcriptionProgress' in harness.storageArea.store, false);
 });
 
+test('background enriches batch chunk transcripts with active video timestamps', { concurrency: false }, async (t) => {
+  const harness = createHarness({
+    initialStorage: { providerSettings: createSettings() },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+      assert.equal(tabId, 61);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return {
+        hasVideo: true,
+        currentTimeSec: 20.4,
+        durationSec: 120,
+        paused: false
+      };
+    },
+    adapterBehaviors: {
+      openai: {
+        async transcribe() {
+          return { text: 'chunk con video' };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const started = await harness.startCapture({ tabId: 61, tabTitle: 'Chunk timestamp', tabUrl: 'https://example.com/chunk-timestamp' });
+  assert.equal(started.ok, true);
+
+  const chunkResult = await harness.dispatchChunk({
+    sessionId: started.transcriptSession.id,
+    chunkIndex: 0,
+    body: 'video-audio'
+  });
+
+  assert.equal(chunkResult.ok, true);
+  assert.equal(harness.storageArea.store.transcript.text, 'chunk con video [00m 20s]');
+  assert.equal(harness.storageArea.store.transcript.final, 'chunk con video [00m 20s]');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'chunk con video',
+      timestampSec: 20.4,
+      timestampLabel: '[00m 20s]'
+    }
+  ]);
+  assert.equal(harness.chrome.__tabMessages.at(-1).tabId, 61);
+});
+
+test('background falls back to unlabeled batch segments when video snapshot times out', { concurrency: false }, async (t) => {
+  const harness = createHarness({
+    initialStorage: { providerSettings: createSettings() },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+
+      assert.equal(tabId, 62);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return new Promise(() => {});
+    },
+    adapterBehaviors: {
+      openai: {
+        async transcribe() {
+          return { text: 'chunk timeout' };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+  global.setTimeout = nativeSetTimeout;
+  global.clearTimeout = nativeClearTimeout;
+
+  const started = await harness.startCapture({ tabId: 62, tabTitle: 'Chunk timeout', tabUrl: 'https://example.com/chunk-timeout' });
+  assert.equal(started.ok, true);
+
+  const chunkResult = await harness.dispatchChunk({
+    sessionId: started.transcriptSession.id,
+    chunkIndex: 0,
+    body: 'timeout-audio'
+  });
+
+  assert.equal(chunkResult.ok, true);
+  assert.equal(harness.storageArea.store.transcript.text, 'chunk timeout');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'chunk timeout',
+      timestampSec: null,
+      timestampLabel: null
+    }
+  ]);
+});
+
+test('background stores unlabeled batch segments when the tab has no active video', { concurrency: false }, async (t) => {
+  const harness = createHarness({
+    initialStorage: { providerSettings: createSettings() },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+
+      assert.equal(tabId, 63);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return { hasVideo: false };
+    },
+    adapterBehaviors: {
+      openai: {
+        async transcribe() {
+          return { text: 'chunk sin video' };
+        }
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const started = await harness.startCapture({ tabId: 63, tabTitle: 'Chunk no video', tabUrl: 'https://example.com/chunk-no-video' });
+  assert.equal(started.ok, true);
+
+  const chunkResult = await harness.dispatchChunk({
+    sessionId: started.transcriptSession.id,
+    chunkIndex: 0,
+    body: 'no-video-audio'
+  });
+
+  assert.equal(chunkResult.ok, true);
+  assert.equal(harness.storageArea.store.transcript.text, 'chunk sin video');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'chunk sin video',
+      timestampSec: null,
+      timestampLabel: null
+    }
+  ]);
+});
+
 test('background keeps live partials volatile, appends finals, suppresses late partials, and marks fallback without crashing', { concurrency: false }, async (t) => {
   const settings = createSettings();
   settings.defaultProvider = 'deepgram';
@@ -173,6 +308,19 @@ test('background keeps live partials volatile, appends finals, suppresses late p
 
   const harness = createHarness({
     initialStorage: { providerSettings: settings },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+      assert.equal(tabId, 52);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return {
+        hasVideo: true,
+        currentTimeSec: 65,
+        durationSec: 300,
+        paused: false
+      };
+    },
     adapterBehaviors: {
       deepgramLiveTransport: {
         connect: async () => true,
@@ -198,6 +346,10 @@ test('background keeps live partials volatile, appends finals, suppresses late p
   assert.equal(partialResult.transcript.interim, 'hola par');
   assert.equal(harness.storageArea.store.transcript.interim, 'hola par');
   assert.equal(harness.storageArea.store.transcript.mode, 'live');
+  assert.equal(
+    harness.chrome.__tabMessages.some((entry) => entry.message && entry.message.action === 'getActiveVideoTime'),
+    false
+  );
 
   const finalResult = await background.applyLiveTranscriptEvent({
     action: 'liveFinal',
@@ -208,9 +360,16 @@ test('background keeps live partials volatile, appends finals, suppresses late p
   });
   assert.equal(finalResult.ok, true);
   assert.equal(harness.storageArea.store.transcript.interim, '');
-  assert.equal(harness.storageArea.store.transcript.text, 'hola final ');
-  assert.equal(harness.storageArea.store.transcript.final, 'hola final ');
+  assert.equal(harness.storageArea.store.transcript.text, 'hola final [01m 05s]');
+  assert.equal(harness.storageArea.store.transcript.final, 'hola final [01m 05s]');
   assert.equal(harness.storageArea.store.transcript.mode, 'live');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'hola final',
+      timestampSec: 65,
+      timestampLabel: '[01m 05s]'
+    }
+  ]);
 
   const latePartialResult = await background.applyLiveTranscriptEvent({
     action: 'livePartial',
@@ -221,7 +380,7 @@ test('background keeps live partials volatile, appends finals, suppresses late p
   });
   assert.equal(latePartialResult.ok, true);
   assert.equal(latePartialResult.suppressed, true);
-  assert.equal(harness.storageArea.store.transcript.text, 'hola final ');
+  assert.equal(harness.storageArea.store.transcript.text, 'hola final [01m 05s]');
   assert.equal(harness.storageArea.store.transcript.interim, '');
 
   const errorResult = await background.handleLiveError({
@@ -271,6 +430,14 @@ test('background degrades startup live failure to batch and keeps finalized text
   };
   const harness = createHarness({
     initialStorage: { providerSettings: settings },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+      assert.equal(tabId, 53);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return { hasVideo: false };
+    },
     liveProviderSessionRuntime: immediateReconnectRuntime,
     adapterBehaviors: {
       deepgramLiveTransport: {
@@ -310,7 +477,14 @@ test('background degrades startup live failure to batch and keeps finalized text
     at: 20
   });
   assert.equal(liveFinalResult.ok, true);
-  assert.equal(harness.storageArea.store.transcript.text, 'live final ');
+  assert.equal(harness.storageArea.store.transcript.text, 'live final');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'live final',
+      timestampSec: null,
+      timestampLabel: null
+    }
+  ]);
 
   const chunkResult = await harness.dispatchChunk({
     sessionId: started.transcriptSession.id,
@@ -318,8 +492,8 @@ test('background degrades startup live failure to batch and keeps finalized text
     body: 'batch-audio'
   });
   assert.equal(chunkResult.ok, true);
-  assert.equal(harness.storageArea.store.transcript.text, 'live final texto batch ');
-  assert.equal(harness.storageArea.store.transcript.final, 'live final texto batch ');
+  assert.equal(harness.storageArea.store.transcript.text, 'live final\ntexto batch');
+  assert.equal(harness.storageArea.store.transcript.final, 'live final\ntexto batch');
   assert.equal(harness.storageArea.store.transcript.mode, 'batch');
 });
 
@@ -330,6 +504,19 @@ test('background exposes live transcript surface with faster polling and auditab
 
   const harness = createHarness({
     initialStorage: { providerSettings: settings },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+      assert.equal(tabId, 60);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return {
+        hasVideo: true,
+        currentTimeSec: 125,
+        durationSec: 400,
+        paused: true
+      };
+    },
     adapterBehaviors: {
       deepgramLiveTransport: {
         connect: async () => true,
@@ -378,7 +565,7 @@ test('background exposes live transcript surface with faster polling and auditab
     text: 'hola final',
     at: 3
   });
-  assert.equal(finalResult.liveTranscript.final, 'hola final ');
+  assert.equal(finalResult.liveTranscript.final, 'hola final [02m 05s]');
   assert.equal(finalResult.liveTranscript.interim, '');
 
   const fallbackResult = await background.handleLiveFallback({
@@ -410,7 +597,7 @@ test('background exposes live transcript surface with faster polling and auditab
 
   const liveTranscriptResponse = await harness.getLiveTranscript(started.transcriptSession.id);
   assert.equal(liveTranscriptResponse.ok, true);
-  assert.equal(liveTranscriptResponse.liveTranscript.text, 'hola final segmento batch ');
+  assert.equal(liveTranscriptResponse.liveTranscript.text, 'hola final [02m 05s]\nsegmento batch [02m 05s]');
   assert.equal(liveTranscriptResponse.liveTranscript.terminalStatus, 'fallback-to-batch');
   assert.equal(liveTranscriptResponse.liveTranscript.liveMeta.finalSegments, 1);
   assert.equal(liveTranscriptResponse.liveTranscript.pollIntervalMs, 300);
@@ -421,4 +608,53 @@ test('background exposes live transcript surface with faster polling and auditab
   assert.equal(storedSession.audit.liveEvents.some((event) => event.event === 'live:close'), true);
   const partialAuditEvent = storedSession.audit.liveEvents.find((event) => event.event === 'live:partial');
   assert.equal(partialAuditEvent.payload.meta.token, '[redacted]');
+});
+
+test('background stores live finals without timestamp when no active video exists', { concurrency: false }, async (t) => {
+  const settings = createSettings();
+  settings.defaultProvider = 'deepgram';
+  settings.providers.deepgram = { enabled: true, apiKey: 'dg-key', liveEnabled: true };
+
+  const harness = createHarness({
+    initialStorage: { providerSettings: settings },
+    tabSendMessage(tabId, message) {
+      if (message.type === 'recording-state-changed') {
+        return { ok: true };
+      }
+
+      assert.equal(tabId, 64);
+      assert.deepEqual(message, { action: 'getActiveVideoTime' });
+      return { hasVideo: false };
+    },
+    adapterBehaviors: {
+      deepgramLiveTransport: {
+        connect: async () => true,
+        send: async () => true,
+        close: async () => true
+      }
+    }
+  });
+  t.after(() => harness.dispose());
+
+  const background = require('../background.js');
+  const started = await harness.startCapture({ tabId: 64, tabTitle: 'Live no video', tabUrl: 'https://example.com/live-no-video' });
+  assert.equal(started.ok, true);
+
+  const finalResult = await background.applyLiveTranscriptEvent({
+    action: 'liveFinal',
+    sessionId: started.transcriptSession.id,
+    providerId: 'deepgram',
+    text: 'sin timestamp',
+    at: 30
+  });
+
+  assert.equal(finalResult.ok, true);
+  assert.equal(harness.storageArea.store.transcript.text, 'sin timestamp');
+  assert.deepEqual(harness.storageArea.store.transcript.segments, [
+    {
+      text: 'sin timestamp',
+      timestampSec: null,
+      timestampLabel: null
+    }
+  ]);
 });

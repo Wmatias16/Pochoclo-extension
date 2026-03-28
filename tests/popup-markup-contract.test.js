@@ -70,3 +70,17 @@ test('popup exposes transcription progress container mounts above transcript box
     'progress container should render before #transcriptBox'
   );
 });
+
+test('popup exposes transcript segment mounts and timestamp styling hooks', () => {
+  const html = readPopupHtml();
+
+  [
+    'id="transcriptText"',
+    'id="detailText"',
+    '.transcript-segment',
+    '.transcript-timestamp',
+    '.detail-segment'
+  ].forEach((token) => {
+    assert.match(html, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  });
+});

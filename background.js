@@ -36,6 +36,12 @@ const recordingAwarenessRuntime = globalThis.PochoclaRecordingAwareness
     ? require('./runtime/recording-awareness.js')
     : {});
 const transcriptionSummarizer = globalThis.PochoclaTranscriptionSummarizer;
+const nodeTimers = typeof module === 'object' && module.exports
+  ? require('node:timers')
+  : null;
+const nodeTimersPromises = typeof module === 'object' && module.exports
+  ? require('node:timers/promises')
+  : null;
 const providerAdapters = {
   openai: globalThis.PochoclaOpenAIAdapter,
   deepgram: globalThis.PochoclaDeepgramAdapter,
@@ -76,6 +82,29 @@ const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const OPENAI_LIVE_TRANSCRIPTION_CHUNK_MS = 3000;
 const POPUP_BATCH_POLL_MS = 300;
 const POPUP_LIVE_POLL_MS = 150;
+const ACTIVE_VIDEO_SNAPSHOT_TIMEOUT_MS = 2000;
+const activeVideoSnapshotSetTimeout = nodeTimers && typeof nodeTimers.setTimeout === 'function'
+  ? nodeTimers.setTimeout
+  : setTimeout;
+const activeVideoSnapshotClearTimeout = nodeTimers && typeof nodeTimers.clearTimeout === 'function'
+  ? nodeTimers.clearTimeout
+  : clearTimeout;
+
+function createActiveVideoSnapshotTimeoutPromise() {
+  if (nodeTimersPromises && typeof nodeTimersPromises.setTimeout === 'function') {
+    return nodeTimersPromises.setTimeout(ACTIVE_VIDEO_SNAPSHOT_TIMEOUT_MS, { hasVideo: false }, { ref: true });
+  }
+
+  return new Promise((resolve) => {
+    const timeoutId = activeVideoSnapshotSetTimeout(() => {
+      resolve({ hasVideo: false });
+    }, ACTIVE_VIDEO_SNAPSHOT_TIMEOUT_MS);
+
+    if (timeoutId && typeof timeoutId.unref === 'function') {
+      timeoutId.ref();
+    }
+  });
+}
 
 const PRODUCT_NAME = 'Pochoclo - Transcriptor';
 /**
@@ -241,12 +270,20 @@ function createTranscriptRecord(record = {}, defaultMode = 'batch') {
     return transcriptionStore.normalizeTranscription(record, defaultMode);
   }
 
+  const segments = Array.isArray(record && record.segments)
+    ? record.segments.map((segment) => ({
+      text: typeof (segment && segment.text) === 'string' ? segment.text : '',
+      timestampSec: Number.isFinite(Number(segment && segment.timestampSec)) ? Number(segment.timestampSec) : null,
+      timestampLabel: hasText(segment && segment.timestampLabel) ? segment.timestampLabel.trim() : null
+    }))
+    : [];
   const text = typeof record.text === 'string'
     ? record.text
     : (typeof record.final === 'string' ? record.final : '');
   return {
     text,
     final: typeof record.final === 'string' ? record.final : text,
+    segments,
     interim: typeof record.interim === 'string' ? record.interim : '',
     mode: record && typeof record.mode === 'string' ? record.mode : defaultMode,
     fallbackReason: null,
@@ -389,6 +426,102 @@ async function patchStoredTranscript(patch = {}, defaultMode = 'batch') {
   }, patch.mode || current.mode || defaultMode);
   await chrome.storage.local.set({ transcript: next });
   return next;
+}
+
+function normalizeVideoSnapshot(snapshot) {
+  if (!snapshot || snapshot.hasVideo !== true) {
+    return { hasVideo: false };
+  }
+
+  return {
+    hasVideo: true,
+    currentTimeSec: Number.isFinite(Number(snapshot.currentTimeSec)) ? Number(snapshot.currentTimeSec) : null,
+    durationSec: Number.isFinite(Number(snapshot.durationSec)) ? Number(snapshot.durationSec) : null,
+    paused: !!snapshot.paused
+  };
+}
+
+async function requestActiveVideoSnapshot(tabId) {
+  if (!Number.isInteger(tabId) || !chrome.tabs || typeof chrome.tabs.sendMessage !== 'function') {
+    return { hasVideo: false };
+  }
+
+  try {
+    const timeoutPromise = createActiveVideoSnapshotTimeoutPromise();
+
+    const snapshotPromise = Promise.resolve()
+      .then(() => chrome.tabs.sendMessage(tabId, { action: 'getActiveVideoTime' }))
+      .then((snapshot) => normalizeVideoSnapshot(snapshot))
+      .catch(() => ({ hasVideo: false }));
+
+    return await Promise.race([snapshotPromise, timeoutPromise]);
+  } catch (error) {
+    return { hasVideo: false };
+  }
+}
+
+function formatSegmentTimestampLabel(timestampSec) {
+  if (!transcriptionStore || typeof transcriptionStore.formatTranscriptTimestamp !== 'function') {
+    return null;
+  }
+
+  return transcriptionStore.formatTranscriptTimestamp(timestampSec);
+}
+
+function buildTranscriptTextFromSegmentsSafe(segments) {
+  if (transcriptionStore && typeof transcriptionStore.buildTranscriptTextFromSegments === 'function') {
+    return transcriptionStore.buildTranscriptTextFromSegments(segments);
+  }
+
+  return Array.isArray(segments)
+    ? segments
+      .map((segment) => {
+        if (!segment || typeof segment !== 'object') {
+          return '';
+        }
+
+        const segmentText = typeof segment.text === 'string' ? segment.text : '';
+        return segment.timestampLabel
+          ? `${segmentText} ${segment.timestampLabel}`.trim()
+          : segmentText;
+      })
+      .filter(Boolean)
+      .join('\n')
+    : '';
+}
+
+async function appendTranscriptSegment(text, options = {}) {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (!normalizedText) {
+    return null;
+  }
+
+  const snapshot = normalizeVideoSnapshot(options.snapshot);
+  const timestampSec = snapshot.hasVideo ? snapshot.currentTimeSec : null;
+  const segment = {
+    text: normalizedText,
+    timestampSec,
+    timestampLabel: timestampSec === null ? null : formatSegmentTimestampLabel(timestampSec)
+  };
+
+  const { transcript } = await chrome.storage.local.get('transcript');
+  const current = createTranscriptRecord(transcript, options.mode || 'batch');
+  const segments = Array.isArray(current.segments) ? current.segments.slice() : [];
+  segments.push(segment);
+
+  const flatText = buildTranscriptTextFromSegmentsSafe(segments);
+  const nextTranscript = await patchStoredTranscript({
+    text: flatText,
+    final: flatText,
+    segments,
+    interim: '',
+    mode: options.mode || current.mode || 'batch'
+  }, options.mode || current.mode || 'batch');
+
+  return {
+    segment,
+    transcript: nextTranscript
+  };
 }
 
 function setLiveTranscriptInterim(sessionId, interim) {
@@ -1158,8 +1291,19 @@ async function applyLiveTranscriptEvent(message = {}) {
   }
 
   if (message.action === 'liveFinal') {
-    nextTranscript.text = appendLiveFinalText(nextTranscript.text, message.text);
-    nextTranscript.final = nextTranscript.text;
+    const snapshot = await requestActiveVideoSnapshot(transcriptSession.tabId);
+    const appendResult = await appendTranscriptSegment(message.text, {
+      mode: transcriptSession.mode === 'batch' ? 'batch' : 'live',
+      snapshot
+    });
+    const appendedTranscript = appendResult && appendResult.transcript
+      ? appendResult.transcript
+      : nextTranscript;
+    nextTranscript.text = appendedTranscript.text;
+    nextTranscript.final = appendedTranscript.final;
+    nextTranscript.segments = Array.isArray(appendedTranscript.segments)
+      ? appendedTranscript.segments.slice()
+      : [];
     nextTranscript.interim = '';
     nextTranscript.mode = transcriptSession.mode === 'batch' ? 'batch' : 'live';
     clearLiveTranscriptInterim(message.sessionId);
@@ -2717,6 +2861,7 @@ async function handleProcessChunk(message) {
   }
 
   let result;
+  let appendedChunkText = '';
   try {
     result = await runtime.executeChunkWithFallback({
       session: transcriptSession,
@@ -2727,7 +2872,9 @@ async function handleProcessChunk(message) {
       normalizeProviderError: providerErrors && typeof providerErrors.normalizeProviderError === 'function'
         ? providerErrors.normalizeProviderError
         : null,
-      appendTranscriptText: saveTranscriptQueued,
+      appendTranscriptText: async (text) => {
+        appendedChunkText = typeof text === 'string' ? text : '';
+      },
       isHallucination,
       fetchImpl: fetch.bind(globalThis),
       setTimeoutImpl: setTimeout,
@@ -2737,6 +2884,14 @@ async function handleProcessChunk(message) {
 
     if (result && result.session) {
       await setTranscriptSession(result.session);
+    }
+
+    if (result && result.ok && result.transcriptAppended && hasText(appendedChunkText)) {
+      const snapshot = await requestActiveVideoSnapshot(transcriptSession.tabId);
+      await appendTranscriptSegment(appendedChunkText, {
+        mode: transcriptSession.mode === 'live' ? 'live' : 'batch',
+        snapshot
+      });
     }
 
     return {
@@ -2794,6 +2949,9 @@ async function autoSaveTranscript(prevState, transcriptSession) {
     title: prevState.tabTitle || 'Transcripción sin título',
     text: transcriptText,
     final: transcript && typeof transcript.final === 'string' ? transcript.final : transcriptText,
+    segments: transcript && Array.isArray(transcript.segments)
+      ? transcript.segments.map((segment) => ({ ...segment }))
+      : [],
     interim: '',
     url: prevState.tabUrl || '',
     date: Date.now(),
@@ -2904,6 +3062,7 @@ if (typeof module === 'object' && module.exports) {
     handleLiveClose,
     handleLiveReconnect,
     handleInactivityAlarm,
+    appendTranscriptSegment,
     getTranscriptionProgress,
     handleProcessChunk,
     handleReminderAlarm,
@@ -2911,6 +3070,7 @@ if (typeof module === 'object' && module.exports) {
     normalizeRecordingState,
     parseRecordingAwarenessAlarmName,
     patchTranscriptionProgress,
+    requestActiveVideoSnapshot,
     setTranscriptionProgress,
     syncTranscriptionProgress
   };

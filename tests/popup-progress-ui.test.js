@@ -81,14 +81,20 @@ class FakeElement {
   set textContent(value) {
     this._textContent = value == null ? '' : String(value);
     this._innerHTML = escapeHtml(this._textContent);
+    this.children = [];
   }
 
   get textContent() {
-    return this._textContent;
+    if (this.children.length === 0) {
+      return this._textContent;
+    }
+
+    return `${this._textContent}${this.children.map((child) => child.textContent).join('')}`;
   }
 
   set innerHTML(value) {
     this._innerHTML = value == null ? '' : String(value);
+    this._textContent = '';
     if (this._innerHTML === '') {
       this.children = [];
     }
@@ -288,7 +294,7 @@ function buildPopupDom() {
   mountElement(document, 'progressRatio', 'span', { parent: progressContainer, textContent: '0/0 clips procesados' });
 
   const transcriptBox = mountElement(document, 'transcriptBox', 'div', { parent: viewRecorder });
-  mountElement(document, 'transcriptText', 'span', { parent: transcriptBox });
+  mountElement(document, 'transcriptText', 'div', { parent: transcriptBox });
   mountElement(document, 'placeholder', 'div', { parent: transcriptBox, style: { display: 'flex' } });
 
   mountElement(document, 'btnRecord', 'button');
@@ -335,6 +341,19 @@ function buildPopupDom() {
   mountElement(document, 'providerSettingsHint', 'div');
 
   return document;
+}
+
+function findElementsByClass(root, className, matches = []) {
+  if (!root) {
+    return matches;
+  }
+
+  if (root.classList && root.classList.contains(className)) {
+    matches.push(root);
+  }
+
+  root.children.forEach((child) => findElementsByClass(child, className, matches));
+  return matches;
 }
 
 function createPopupChrome(storageArea, responses = {}) {
@@ -775,4 +794,208 @@ test('popup renders live interim text with a distinct class and uses faster live
   assert.equal(!!interimEl, true);
   assert.equal(interimEl.textContent, ' interim visible');
   assert.equal(interimEl.classList.contains('transcript-interim'), true);
+});
+
+test('popup live transcript renders timestamped segments when segments exist', async (t) => {
+  const popup = await loadPopupHarness({
+    stateResponse: { status: 'recording', startTime: Date.now() - 2_000, pausedAt: 0, pausedDuration: 0 },
+    runtimeResponses: {
+      getTranscriptionSession: {
+        ok: true,
+        transcriptSession: {
+          id: 'session-segments-live',
+          mode: 'live'
+        }
+      },
+      getLiveTranscript: {
+        ok: true,
+        liveTranscript: {
+          sessionId: 'session-segments-live',
+          text: 'Hola como estas [00m 20s]\nSeguimos [00m 25s]',
+          final: 'Hola como estas [00m 20s]\nSeguimos [00m 25s]',
+          mode: 'live',
+          segments: [
+            { text: 'Hola como estas', timestampSec: 20, timestampLabel: '[00m 20s]' },
+            { text: 'Seguimos', timestampSec: 25, timestampLabel: '[00m 25s]' }
+          ]
+        }
+      }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.advanceTimers(150);
+  await popup.flush();
+
+  const transcriptText = popup.document.getElementById('transcriptText');
+  const segments = findElementsByClass(transcriptText, 'transcript-segment');
+  const timestamps = findElementsByClass(transcriptText, 'transcript-timestamp');
+
+  assert.equal(segments.length, 2);
+  assert.equal(timestamps.length, 2);
+  assert.equal(segments[0].textContent.includes('Hola como estas'), true);
+  assert.equal(timestamps[0].textContent.trim(), '[00m 20s]');
+  assert.equal(timestamps[1].textContent.trim(), '[00m 25s]');
+  assert.equal(popup.document.getElementById('btnCopy').disabled, false);
+});
+
+test('popup live transcript falls back to flat text when there are no segments', async (t) => {
+  const popup = await loadPopupHarness({
+    stateResponse: { status: 'recording', startTime: Date.now() - 2_000, pausedAt: 0, pausedDuration: 0 },
+    runtimeResponses: {
+      getTranscriptionSession: {
+        ok: true,
+        transcriptSession: {
+          id: 'session-flat-live',
+          mode: 'live'
+        }
+      },
+      getLiveTranscript: {
+        ok: true,
+        liveTranscript: {
+          sessionId: 'session-flat-live',
+          text: 'Texto legacy sin segmentos',
+          final: 'Texto legacy sin segmentos',
+          mode: 'live',
+          segments: []
+        }
+      }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.advanceTimers(150);
+  await popup.flush();
+
+  const transcriptText = popup.document.getElementById('transcriptText');
+  const segments = findElementsByClass(transcriptText, 'transcript-segment');
+
+  assert.equal(segments.length, 0);
+  assert.equal(transcriptText.textContent, 'Texto legacy sin segmentos');
+});
+
+test('popup live transcript omits timestamp span for unlabeled segments', async (t) => {
+  const popup = await loadPopupHarness({
+    stateResponse: { status: 'recording', startTime: Date.now() - 2_000, pausedAt: 0, pausedDuration: 0 },
+    runtimeResponses: {
+      getTranscriptionSession: {
+        ok: true,
+        transcriptSession: {
+          id: 'session-mixed-live',
+          mode: 'live'
+        }
+      },
+      getLiveTranscript: {
+        ok: true,
+        liveTranscript: {
+          sessionId: 'session-mixed-live',
+          text: 'Hola [00m 20s]\nSin tiempo',
+          final: 'Hola [00m 20s]\nSin tiempo',
+          mode: 'live',
+          segments: [
+            { text: 'Hola', timestampSec: 20, timestampLabel: '[00m 20s]' },
+            { text: 'Sin tiempo', timestampSec: null, timestampLabel: null }
+          ]
+        }
+      }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.advanceTimers(150);
+  await popup.flush();
+
+  const transcriptText = popup.document.getElementById('transcriptText');
+  const segments = findElementsByClass(transcriptText, 'transcript-segment');
+  const timestamps = findElementsByClass(transcriptText, 'transcript-timestamp');
+
+  assert.equal(segments.length, 2);
+  assert.equal(timestamps.length, 1);
+  assert.equal(segments[1].textContent.includes('Sin tiempo'), true);
+  assert.equal(segments[1].textContent.includes('[00m 20s]'), false);
+});
+
+test('popup gracefully renders live transcript without timestamps when the tab has no video', async (t) => {
+  const popup = await loadPopupHarness({
+    stateResponse: { status: 'recording', startTime: Date.now() - 2_000, pausedAt: 0, pausedDuration: 0 },
+    runtimeResponses: {
+      getTranscriptionSession: {
+        ok: true,
+        transcriptSession: {
+          id: 'session-no-video-live',
+          mode: 'live'
+        }
+      },
+      getLiveTranscript: {
+        ok: true,
+        liveTranscript: {
+          sessionId: 'session-no-video-live',
+          text: 'Texto sin video',
+          final: 'Texto sin video',
+          mode: 'live',
+          segments: [
+            { text: 'Texto sin video', timestampSec: null, timestampLabel: null }
+          ]
+        }
+      }
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.advanceTimers(150);
+  await popup.flush();
+
+  const transcriptText = popup.document.getElementById('transcriptText');
+  const segments = findElementsByClass(transcriptText, 'transcript-segment');
+  const timestamps = findElementsByClass(transcriptText, 'transcript-timestamp');
+
+  assert.equal(segments.length, 1);
+  assert.equal(timestamps.length, 0);
+  assert.equal(segments[0].textContent.trim(), 'Texto sin video');
+  assert.equal(popup.document.getElementById('btnCopy').disabled, false);
+});
+
+test('popup detail view renders stored segments with timestamps while history preview stays flat', async (t) => {
+  const savedTranscriptions = [{
+    id: 'tx-segmented-detail',
+    title: 'Detalle con segmentos',
+    text: 'Texto plano derivado',
+    segments: [
+      { text: 'Primer bloque', timestampSec: 20, timestampLabel: '[00m 20s]' },
+      { text: 'Segundo bloque', timestampSec: null, timestampLabel: null }
+    ],
+    url: 'https://example.com/video',
+    date: Date.now(),
+    duration: 125,
+    language: 'es',
+    resolvedProvider: 'openai',
+    status: 'completed',
+    providerAudit: null
+  }];
+
+  const popup = await loadPopupHarness({
+    runtimeResponses: {
+      getTranscriptions: () => savedTranscriptions
+    }
+  });
+  t.after(() => popup.cleanup());
+
+  popup.document.getElementById('btnHistory').dispatchEvent('click');
+  await popup.flush();
+
+  const historyItem = popup.document.getElementById('historyList').children[0];
+  assert.equal(historyItem.innerHTML.includes('Texto plano derivado'), true);
+  assert.equal(historyItem.innerHTML.includes('[00m 20s]'), false);
+
+  historyItem.dispatchEvent('click');
+  await popup.flush();
+
+  const detailText = popup.document.getElementById('detailText');
+  const detailSegments = findElementsByClass(detailText, 'detail-segment');
+  const detailTimestamps = findElementsByClass(detailText, 'transcript-timestamp');
+
+  assert.equal(detailSegments.length, 2);
+  assert.equal(detailTimestamps.length, 1);
+  assert.equal(detailTimestamps[0].textContent.trim(), '[00m 20s]');
+  assert.equal(detailSegments[1].textContent.includes('Segundo bloque'), true);
 });

@@ -215,6 +215,10 @@ class FakeMediaRecorder {
   }
 
   emitChunk(body = LARGE_CHUNK_BODY, type = 'audio/webm;codecs=opus') {
+    if (this.state !== 'recording') {
+      return;
+    }
+
     if (typeof this.ondataavailable !== 'function') {
       return;
     }
@@ -262,6 +266,10 @@ class FakeMediaRecorder {
       this.state = 'recording';
     }
   }
+}
+
+function getBatchRecorders() {
+  return FakeMediaRecorder.instances.filter((instance) => instance.startTimeslice !== 250);
 }
 
 test('offscreen batch capture keeps queueing MediaRecorder chunks while the first background response is still pending', async () => {
@@ -348,12 +356,14 @@ test('offscreen batch capture keeps queueing MediaRecorder chunks while the firs
     const audioContext = FakeAudioContext.instances[0];
     assert.equal(audioContext.processorNodes.length, 0);
 
-    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
-    assert.equal(!!sessionRecorder, true);
+    await waitFor(() => getBatchRecorders().length >= 1, 100);
+    const firstChunkRecorder = getBatchRecorders()[0];
+    assert.equal(!!firstChunkRecorder, true);
 
-    sessionRecorder.emitChunk('batch-pending-1');
-    await wait(30);
-    sessionRecorder.emitChunk('batch-pending-2');
+    firstChunkRecorder.emitChunk('batch-pending-1');
+    await waitFor(() => getBatchRecorders().length >= 2, 200);
+    const secondChunkRecorder = getBatchRecorders()[1];
+    secondChunkRecorder.emitChunk('batch-pending-2');
 
     await waitFor(() => enqueueCount >= 2, 600);
 
@@ -443,23 +453,29 @@ test('offscreen batch capture stays on MediaRecorder/WebM through pause/resume w
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
     assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
 
-    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
-    assert.equal(!!sessionRecorder, true);
-    sessionRecorder.emitChunk('batch-before-pause');
-    await wait(30);
+    await waitFor(() => getBatchRecorders().length >= 1, 100);
+    const firstChunkRecorder = getBatchRecorders()[0];
+    assert.equal(!!firstChunkRecorder, true);
+    firstChunkRecorder.emitChunk('batch-before-pause');
+    await waitFor(() => sentMessages.filter((message) => message && message.target === 'background' && message.action === 'processChunk').length >= 1, 500);
+    await waitFor(() => getBatchRecorders().length >= 2, 200);
+    const pausedChunkRecorder = getBatchRecorders()[1];
 
     const paused = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'pause' });
     assert.equal(paused.ok, true);
 
-    sessionRecorder.emitChunk('ignored-while-paused');
+    pausedChunkRecorder.emitChunk('ignored-while-paused');
     await wait(30);
 
     const resumed = await chrome.runtime.sendMessage({ target: 'offscreen', action: 'resume' });
     assert.equal(resumed.ok, true);
     assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
 
+    await waitFor(() => getBatchRecorders().length >= 3, 200);
+    const resumedChunkRecorder = getBatchRecorders()[2];
+
     nowValue += 200;
-    sessionRecorder.emitChunk('batch-after-resume');
+    resumedChunkRecorder.emitChunk('batch-after-resume');
     await waitFor(
       () => sentMessages.filter((message) => message && message.target === 'background' && message.action === 'processChunk').length >= 2,
       500
@@ -544,8 +560,7 @@ test('offscreen only enables batch PCM capture behind an explicit pcm16 provider
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
     assert.equal(FakeAudioContext.instances[0].processorNodes.length > 0, true);
-    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
-    assert.equal(!!sessionRecorder, true);
+    assert.equal(getBatchRecorders().length, 0);
 
     const stopped = await chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -635,19 +650,18 @@ test('offscreen syncs accepted batch chunk totals from recorded blobs and keeps 
 
     await waitFor(() => FakeAudioContext.instances.length > 0, 100);
     assert.equal(FakeAudioContext.instances[0].processorNodes.length, 0);
-    const sessionRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
-    assert.equal(!!sessionRecorder, true);
-
-    sessionRecorder.ondataavailable({ data: new Blob([''], { type: 'audio/webm;codecs=opus' }) });
-    await wait(30);
+    await waitFor(() => getBatchRecorders().length >= 1, 100);
+    await waitFor(() => getBatchRecorders().length >= 2, 200);
     assert.equal(
       sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length,
       0
     );
 
-    sessionRecorder.emitChunk('batch-progress-1');
-    await wait(30);
-    sessionRecorder.emitChunk('batch-progress-2');
+    const secondChunkRecorder = getBatchRecorders()[1];
+    secondChunkRecorder.emitChunk('batch-progress-1');
+    await waitFor(() => getBatchRecorders().length >= 3, 200);
+    const thirdChunkRecorder = getBatchRecorders()[2];
+    thirdChunkRecorder.emitChunk('batch-progress-2');
     await waitFor(
       () => sentMessages.filter((message) => message && message.action === 'syncTranscriptionProgress').length >= 2,
       500
@@ -948,7 +962,8 @@ test('offscreen promoteBatchFallback stops live pipeline and resumes MediaRecord
     assert.equal(flushCalls >= 1, true);
     assert.equal(audioContext.processorNodes.length, 1);
 
-    const batchRecorder = FakeMediaRecorder.instances.find((instance) => instance.startTimeslice === 1000);
+    await waitFor(() => getBatchRecorders().length >= 1, 100);
+    const batchRecorder = getBatchRecorders()[0];
     assert.equal(!!batchRecorder, true);
     batchRecorder.emitChunk('fallback-batch');
     await waitFor(() => processChunkCalls >= 1, 500);

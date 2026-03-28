@@ -7,7 +7,6 @@ let liveMediaRecorder = null;
 let audioContext = null;
 let analyser = null;
 let mediaStreamSource = null;
-let audioChunks = [];
 const chunkProcessor = globalThis.PochoclaChunkProcessor;
 const offscreenBridge = globalThis.PochoclaOffscreenBridge;
 const liveProviderSessionRuntime = globalThis.PochoclaLiveProviderSessionRuntime;
@@ -16,7 +15,6 @@ const providerRegistry = globalThis.PochoclaProviderRegistry || null;
 const DEFAULT_TRANSCRIPTION_CHUNK_MS = 7000;
 const DEFAULT_WAV_SAMPLE_RATE = 48000;
 const DEFAULT_LIVE_RECORDER_TIMESLICE_MS = 250;
-const DEFAULT_BATCH_RECORDER_TIMESLICE_MS = 1000;
 const LIVE_MEDIA_RECORDER_MIME_TYPE = 'audio/webm;codecs=opus';
 // Significant-amplitude threshold for the V1 inactivity proxy shared with background defaults.
 const PCM_AUDIO_THRESHOLD = 0.05;
@@ -135,7 +133,6 @@ async function startRecording(streamId, sessionContext) {
 
   await initializeSharedCapture(streamId);
 
-  startBatchMediaRecorder();
   startBatchTranscriptionCapture();
 }
 
@@ -156,10 +153,7 @@ function pauseRecording() {
     return;
   }
 
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.pause();
-  }
-  pauseBatchTranscriptionCapture();
+  void pauseBatchTranscriptionCapture();
 }
 
 function resumeRecording() {
@@ -168,9 +162,6 @@ function resumeRecording() {
     return;
   }
 
-  if (mediaRecorder && mediaRecorder.state === 'paused') {
-    mediaRecorder.resume();
-  }
   startBatchTranscriptionCapture();
 }
 
@@ -346,7 +337,6 @@ async function promoteBatchFallback(message = {}) {
   };
 
   currentCaptureMode = 'batch';
-  startBatchMediaRecorder();
   startBatchTranscriptionCapture();
   return true;
 }
@@ -518,80 +508,103 @@ function disconnectTranscriptionProcessorNode() {
   transcriptionProcessorNode = null;
 }
 
-function startBatchMediaRecorder() {
-  if (!mediaStream) {
-    throw new Error('No hay un stream de audio disponible para grabar');
+function scheduleBatchChunkStop(recorder) {
+  clearTranscriptionChunkTimer();
+  transcriptionChunkTimerId = setTimeout(() => {
+    if (mediaRecorder !== recorder || recorder.state === 'inactive') {
+      return;
+    }
+
+    recorder.stop();
+  }, captureSessionContext.chunkIntervalMs || DEFAULT_TRANSCRIPTION_CHUNK_MS);
+}
+
+function finalizeBatchRecorderChunk(chunks) {
+  if (!Array.isArray(chunks) || chunks.length === 0) {
+    return null;
   }
 
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    return mediaRecorder;
+  const mimeType = chunks.find((chunk) => chunk && typeof chunk.type === 'string' && chunk.type.length > 0)?.type
+    || 'audio/webm';
+  const blob = new Blob(chunks, { type: mimeType });
+  return Number.isFinite(Number(blob.size)) && Number(blob.size) > 0 ? blob : null;
+}
+
+function startNextBatchRecorderChunk() {
+  if (!mediaStream || !isTranscribing) {
+    return null;
   }
 
-  mediaRecorder = new MediaRecorder(mediaStream, {
+  const recorder = new MediaRecorder(mediaStream, {
     mimeType: LIVE_MEDIA_RECORDER_MIME_TYPE
   });
-  audioChunks = [];
+  const chunks = [];
 
-  mediaRecorder.ondataavailable = (event) => {
+  recorder.ondataavailable = (event) => {
     const blob = event && event.data;
     if (!blob || !Number.isFinite(Number(blob.size)) || Number(blob.size) <= 0) {
       return;
     }
 
-    audioChunks.push(blob);
+    chunks.push(blob);
   };
 
-  mediaRecorder.start(DEFAULT_BATCH_RECORDER_TIMESLICE_MS);
-  return mediaRecorder;
-}
+  recorder.onstop = () => {
+    const nextChunkShouldStart = isTranscribing && mediaStream === recorder.stream;
+    const finalizedBlob = finalizeBatchRecorderChunk(chunks);
 
-function buildBatchAudioChunkBlob() {
-  if (!Array.isArray(audioChunks) || audioChunks.length === 0) {
-    return null;
-  }
+    if (mediaRecorder === recorder) {
+      mediaRecorder = null;
+    }
 
-  const mimeType = audioChunks.find((chunk) => chunk && typeof chunk.type === 'string' && chunk.type.length > 0)?.type
-    || 'audio/webm';
-  const blob = new Blob(audioChunks, { type: mimeType });
-  audioChunks = [];
-  return blob;
-}
+    if (nextChunkShouldStart) {
+      startNextBatchRecorderChunk();
+    }
 
-function flushRecordedAudioChunk() {
-  const blob = buildBatchAudioChunkBlob();
-  if (!blob || !Number.isFinite(Number(blob.size)) || Number(blob.size) <= 0) {
-    return false;
-  }
+    if (finalizedBlob) {
+      enqueueTranscription(finalizedBlob);
+      return;
+    }
 
-  enqueueTranscription(blob);
-  return true;
+    resolveTranscriptionDrainIfReady();
+  };
+
+  mediaRecorder = recorder;
+  recorder.start();
+  scheduleBatchChunkStop(recorder);
+  return recorder;
 }
 
 function startMediaRecorderBatchTranscriptionCapture() {
-  if (!mediaRecorder || isTranscribing) {
+  if (!mediaStream || isTranscribing) {
     return;
   }
 
   isTranscribing = true;
-  clearTranscriptionChunkTimer();
-  transcriptionChunkTimerId = setInterval(() => {
-    flushRecordedAudioChunk();
-    resolveTranscriptionDrainIfReady();
-  }, captureSessionContext.chunkIntervalMs || DEFAULT_TRANSCRIPTION_CHUNK_MS);
+  startNextBatchRecorderChunk();
 }
 
-function pauseMediaRecorderBatchTranscriptionCapture() {
+async function pauseMediaRecorderBatchTranscriptionCapture() {
   isTranscribing = false;
   clearTranscriptionChunkTimer();
-  flushRecordedAudioChunk();
-  resolveTranscriptionDrainIfReady();
+
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+    mediaRecorder = null;
+    resolveTranscriptionDrainIfReady();
+    return;
+  }
+
+  await stopMediaRecorderInstance(mediaRecorder);
 }
 
 async function stopMediaRecorderBatchTranscriptionCapture() {
   clearTranscriptionChunkTimer();
-  await stopMediaRecorderInstance(mediaRecorder);
   isTranscribing = false;
-  flushRecordedAudioChunk();
+
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    await stopMediaRecorderInstance(mediaRecorder);
+  }
+  mediaRecorder = null;
   resolveTranscriptionDrainIfReady();
 
   if (transcriptionProcessor.size() > 0 || transcriptionProcessor.isProcessing()) {
